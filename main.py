@@ -13,7 +13,7 @@ load_dotenv()
 # 1. 定义 Bash 执行工具
 @tool
 def execute_bash(command: str) -> str:
-    """在系统的 Shell 中执行给定的 Bash 命令，并返回 stdout 和 stderr。"""
+    """运行指定的命令行指令并返回控制台输出。"""
     try:
         result = subprocess.run(
             command, shell=True, capture_output=True, text=True, timeout=60
@@ -30,7 +30,7 @@ def execute_bash(command: str) -> str:
 tools = [execute_bash]
 
 llm = ChatOpenAI(
-    model="deepseek-chat",
+    model="DeepSeek-V4.1-Flash",
     # 此时会自动从 .env 读取 DEEPSEEK_API_KEY
     api_key=os.getenv("DEEPSEEK_API_KEY"),
     base_url=os.getenv("DEEPSEEK_API_BASE_URL", "https://api.deepseek.ai"),
