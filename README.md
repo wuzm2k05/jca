@@ -106,9 +106,6 @@ The agent's default tools are **file operations confined to `./workspace/`**: `l
 `../.env` and `C:\Windows\...` are both refused. The agent gets its own scratch directory
 and cannot reach anything outside it.
 
-Running commands on your machine is a **separate, opt-in capability**. It is off unless you
-set `JCA_ALLOW_SHELL=1`:
-
 ```bash
 # macOS / Linux
 JCA_ALLOW_SHELL=1 uv run main.py

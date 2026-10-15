@@ -1,5 +1,3 @@
-"""默认关闭的高危能力：执行单条系统命令。"""
-
 import subprocess
 
 from langchain_core.tools import tool

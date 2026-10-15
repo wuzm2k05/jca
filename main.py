@@ -14,7 +14,7 @@ from tools.sandbox import WORKSPACE
 load_dotenv()
 
 
-# 1. 取本次运行可用的工具（默认是文件工具，执行命令的能力需要显式打开）
+# 1. 取本次运行可用的工具
 #    注意：这里 tools 指的是工具列表，不是上面 import 的 tools 包
 tools = build_tools()
 

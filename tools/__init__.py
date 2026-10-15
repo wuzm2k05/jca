@@ -10,8 +10,6 @@ __all__ = ["build_tools"]
 
 def build_tools() -> list:
     """返回本次运行可用的工具清单。
-
-    文件工具默认可用；执行命令的能力属于高危能力，需要用环境变量显式打开。
     """
     tools = list(FILE_TOOLS)
     tools.append(run_cmd)
