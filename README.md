@@ -101,10 +101,35 @@ uv run main.py
 
 ## ⚠️ Safety note
 
-This project gives the agent a tool that runs **shell commands on your machine**. That is
-deliberate — it makes the lesson concrete, and it is also the reason the course spends time
-on keeping decisions separate from execution.
+The agent's default tools are **file operations confined to `./workspace/`**: `list_dir`,
+`read_file`, `write_file`, `edit_file`. Every path is resolved and checked before use, so
+`../.env` and `C:\Windows\...` are both refused. The agent gets its own scratch directory
+and cannot reach anything outside it.
+
+Running commands on your machine is a **separate, opt-in capability**. It is off unless you
+set `JCA_ALLOW_SHELL=1`:
+
+```bash
+# macOS / Linux
+JCA_ALLOW_SHELL=1 uv run main.py
+
+# Windows (PowerShell)
+$env:JCA_ALLOW_SHELL='1'; uv run main.py
+```
+
+Once enabled, that tool (`run_cmd`) still only accepts a **single** command — pipes,
+redirects and `&&` are rejected with an explanation, so the model cannot chain its way
+around the sandbox. It also reports the exit code, so a silent failure no longer looks like
+success.
+
+**This is not a complete sandbox, and it does not pretend to be.** Two limits are worth
+knowing:
+
+- the path check covers the file tools only. With `JCA_ALLOW_SHELL=1`, an absolute path
+  inside a command (`type C:\Windows\...`) can still step outside `./workspace/`;
+- the confinement is path-level, not permission-level — no process isolation, no resource
+  limits, no human approval step.
 
 **Run it on a disposable machine or a container.** Do not point it at a machine holding
 real credentials or data. Expect the code to ask you to make it safer; that is part of the
-exercise.
+exercise — the pieces are deliberately small enough to read and change.
