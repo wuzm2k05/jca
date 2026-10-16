@@ -1,7 +1,4 @@
 """工具注册表：增删能力只改这个文件，图的结构不用动。"""
-
-import os
-
 from .files import FILE_TOOLS
 from .shell import run_cmd
 
