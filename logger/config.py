@@ -51,14 +51,19 @@ class LogConfig:
     def file_path(self) -> Path:
         """日志文件的完整路径。
 
-        按**当前工作目录**解析，和 tools/sandbox.py 的 WORKSPACE 是同一个道理：
+        按**当前工作目录**解析，和 tools/sandbox.py 的 workspace_root() 是同一个道理：
         在哪儿运行，文件就落在哪儿。所以每次读取都重新算一遍 —— 别把它存起来跨
         「改了工作目录」的代码用。
 
         log_dir 写成绝对路径也可以，Path 拼接时绝对路径会直接覆盖前面的部分。
 
-        另外注意：日志**不能**放进 workspace/。那是 agent 自己的沙箱，
-        日志放进去，agent 就能读到、甚至改掉记录它自己行为的文件。
+        另外注意：日志**不该**放进 agent 的沙箱目录（tools/sandbox.py 里的
+        workspace_root()）。放进去，agent 就能读到、甚至改掉记录它自己行为的文件。
+
+        但这两者的默认值正好撞在一起：workspace 默认是「运行目录」，而 log_dir
+        默认是运行目录下的 logs/，于是默认配置下日志就在沙箱里。想分开，
+        两条路任选：给 JCA_WORKSPACE 设一个子目录（沙箱缩进去，日志留在外面），
+        或者把 JCA_LOG_DIR 指到沙箱外。README 里「Logging」一节有现成写法。
         """
         return (Path.cwd() / self.log_dir / self.file_name).resolve()
 

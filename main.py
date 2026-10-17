@@ -12,7 +12,7 @@ from logger import get_logger, setup_logging
 from prompts import build_system_prompt
 from safety import MAX_SAFETY_RETRIES, build_retry_message, is_safety_block
 from tools import build_tools
-from tools.sandbox import WORKSPACE
+from tools.sandbox import workspace_root
 
 # 在程序最开始加载 .env 文件的环境变量
 load_dotenv()
@@ -117,7 +117,12 @@ if __name__ == "__main__":
         ]
     }
 
-    logger.info("本次运行开始", workspace=str(WORKSPACE), tools=[t.name for t in tools], prompt=prompt)
+    logger.info(
+        "本次运行开始",
+        workspace=str(workspace_root()),
+        tools=[t.name for t in tools],
+        prompt=prompt,
+    )
     for chunk in app.stream(inputs, stream_mode="values"):
         latest_msg = chunk["messages"][-1]
         # pretty_print() 是往标准输出直接打印的，绕不进日志（拿不到结构、也没法落盘），

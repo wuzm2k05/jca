@@ -4,7 +4,7 @@ from langchain_core.tools import tool
 
 from logger import get_logger
 
-from .sandbox import WORKSPACE
+from .sandbox import workspace_root
 
 logger = get_logger(__name__)
 
@@ -41,7 +41,15 @@ def run_cmd(command: str) -> str:
         logger.warning("命令被规则拦下，没有执行", cmd=command, reason=problem)
         return problem
 
-    logger.info("执行命令", cmd=command, cwd=str(WORKSPACE))
+    root = workspace_root()
+    if not root.is_dir():
+        # 配了 JCA_WORKSPACE 但那个目录还不存在。这里不替它建——建目录是
+        # write_file 的事，命令该在哪儿跑应该由配置的人说了算，
+        # 悄悄造一个出来只会让人以为配错了也能用。
+        logger.error("工作目录不存在", cwd=str(root))
+        return f"工作目录不存在：{root}，请先建好它，或检查 JCA_WORKSPACE 是否写对。"
+
+    logger.info("执行命令", cmd=command, cwd=str(root))
     try:
         result = subprocess.run(
             command,
@@ -49,7 +57,7 @@ def run_cmd(command: str) -> str:
             capture_output=True,
             text=True,
             errors="replace",
-            cwd=WORKSPACE,
+            cwd=root,
             timeout=TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired:

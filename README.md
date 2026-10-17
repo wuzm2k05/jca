@@ -76,12 +76,17 @@ activate the environment by hand — `uv run` takes care of it.
 
 ### Add your credentials
 
-Create a file named `.env` in the project root:
+Copy the template and fill it in:
 
-```ini
-DEEPSEEK_API_KEY=your-api-key-here
-DEEPSEEK_API_BASE_URL=https://your-endpoint-here/v1
+```bash
+cp .env.example .env        # macOS / Linux
+copy .env.example .env      # Windows (cmd)
 ```
+
+`.env.example` is committed and lists **every** variable this project reads — the model
+credentials, `JCA_WORKSPACE`, and the `JCA_LOG_*` set — with comments. **Copy the names
+exactly.** A misspelled variable name is not an error; `os.getenv` simply returns nothing and
+you get the default, which is the kind of silent difference that costs you an afternoon.
 
 Two things worth checking if the program can't reach the model:
 
@@ -89,8 +94,8 @@ Two things worth checking if the program can't reach the model:
 - the model name is set in the code, so if your endpoint serves a different model, edit it
   there.
 
-> **Keep this file out of git.** It holds a live key. If the lesson you are on does not
-> already ignore `.env`, add it to your `.gitignore` before you commit anything.
+> **Keep `.env` out of git.** It holds a live key. `.env.example` is the one that gets
+> committed; `.gitignore` matches `.env` exactly, so the template is not caught by it.
 
 ### Run
 
@@ -156,17 +161,55 @@ Two things worth knowing:
 
 - third-party logs (`httpx`, `openai`, `langchain`) land in the same file, through the same
   rotation, because everything is funnelled through the standard library;
-- the log directory is deliberately **not** inside `./workspace/`. That directory is the
-  agent's sandbox — it should not be able to read, or edit, the record of its own actions.
+- keep the log directory **out of the agent's workspace** (see the next section). It is the
+  record of what the agent did; the agent should not be able to read or edit it. The two
+  defaults collide — workspace defaults to the run directory and logs default to `logs/`
+  inside it — so if you care, set `JCA_WORKSPACE=workspace` (workspace shrinks to a
+  subdirectory) or point `JCA_LOG_DIR` somewhere else.
+
+---
+
+## 4. The workspace
+
+Everything the agent can touch lives under one root, the **workspace**. Where that root is,
+is set by `JCA_WORKSPACE`:
+
+| `JCA_WORKSPACE` | Workspace root | What it means |
+| --- | --- | --- |
+| unset (**default**) | the directory you run from | the agent works **in your project directory** |
+| `workspace` | `<pwd>/workspace` | the agent gets its own scratch directory |
+| `D:\sandbox\agent` (absolute) | `D:\sandbox\agent` | an absolute path overrides `<pwd>` entirely |
+
+```bash
+# macOS / Linux — keep the agent in ./workspace/
+JCA_WORKSPACE=workspace uv run main.py
+
+# Windows (PowerShell)
+$env:JCA_WORKSPACE='workspace'; uv run main.py
+```
+
+Or put it in `.env` next to your API key — it is read from the same file:
+
+```ini
+JCA_WORKSPACE=workspace
+```
+
+With `JCA_WORKSPACE=workspace` the directory is created on first write (a `write_file` into
+it makes the parent directories). If you point the workspace at something that does not
+exist and the agent then runs a command, `run_cmd` reports the missing directory rather than
+creating it — where commands run is your decision, not a side effect.
 
 ---
 
 ## ⚠️ Safety note
 
-The agent's default tools are **file operations confined to `./workspace/`**: `list_dir`,
-`read_file`, `write_file`, `edit_file`. Every path is resolved and checked before use, so
-`../.env` and `C:\Windows\...` are both refused. The agent gets its own scratch directory
-and cannot reach anything outside it.
+The agent's file tools — `list_dir`, `read_file`, `write_file`, `edit_file` — are confined
+to the workspace. Every path is resolved and checked before use, so `../.env` and
+`C:\Windows\...` are both refused.
+
+**The default root is the directory you run from**, so out of the box the agent can read and
+write your project files, `main.py` included. Set `JCA_WORKSPACE=workspace` to give it its
+own directory instead.
 
 ```bash
 # macOS / Linux
@@ -185,7 +228,7 @@ success.
 knowing:
 
 - the path check covers the file tools only. With `JCA_ALLOW_SHELL=1`, an absolute path
-  inside a command (`type C:\Windows\...`) can still step outside `./workspace/`;
+  inside a command (`type C:\Windows\...`) can still step outside the workspace;
 - the confinement is path-level, not permission-level — no process isolation, no resource
   limits, no human approval step.
 

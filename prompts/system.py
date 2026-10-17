@@ -2,7 +2,7 @@
 
 import platform
 
-from tools.sandbox import WORKSPACE
+from tools.sandbox import workspace_root
 
 
 def build_system_prompt() -> str:
@@ -11,6 +11,6 @@ def build_system_prompt() -> str:
         "你是一个严格的编程agent。\n"
         f"当前运行环境：{platform.system()} {platform.release()}"
         f"（版本 {platform.version()}，{platform.machine()} 架构）。\n"
-        f"工作目录：{WORKSPACE}，所有文件操作都限制在这个目录内。\n"
+        f"工作目录：{workspace_root()}，所有文件操作都限制在这个目录内。\n"
         "请只使用已经提供的工具，不要凭猜测假设本机的系统或路径。"
     )
