@@ -97,6 +97,68 @@ Two things worth checking if the program can't reach the model:
 ```bash
 uv run main.py
 ```
+
+### Logging
+
+The project logs through **structlog on top of the standard library `logging`** — there is
+no `print` left in the code. Every module does:
+
+```python
+from logger import get_logger
+
+logger = get_logger(__name__)
+logger.info("执行命令", cmd=command)
+```
+
+`main.py` calls `setup_logging()` once, right after `load_dotenv()`.
+
+**Where the logs go** is set by environment variables (put them in `.env` next to your API
+key, or set them in the shell):
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `JCA_LOG_TARGET` | `console` | `console`, `file`, or `both` |
+| `JCA_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, … |
+| `JCA_LOG_DIR` | `logs` | directory for log files, relative to the working directory |
+| `JCA_LOG_FILE` | `jca.log` | file name |
+| `JCA_LOG_MAX_BYTES` | `10485760` | rotate once a file passes this size (10 MB) |
+| `JCA_LOG_BACKUP_COUNT` | `5` | how many rotated files to keep |
+
+```bash
+# macOS / Linux — write to both the terminal and ./logs/
+JCA_LOG_TARGET=both JCA_LOG_LEVEL=DEBUG uv run main.py
+
+# Windows (PowerShell)
+$env:JCA_LOG_TARGET='both'; $env:JCA_LOG_LEVEL='DEBUG'; uv run main.py
+```
+
+An unknown value for any of these is a **startup error, not a silent fallback** — a typo in
+`JCA_LOG_LEVEL` should never be the reason your logs went quiet.
+
+**Format.** The terminal gets colourised, human-readable lines; the file gets one JSON
+object per line. Two renderers, one event:
+
+```
+2026-10-16T10:02:16.410199Z [info     ] 执行命令        [tools.shell] cmd='python app.py'
+
+{"event": "执行命令", "cmd": "python app.py", "level": "info",
+ "logger": "tools.shell", "timestamp": "2026-10-16T10:02:16.410199Z"}
+```
+
+Colour is only turned on when stdout is a real terminal, so `uv run main.py > out.txt`
+gives you a clean file.
+
+**Rotation** is in-process (`logging.handlers.RotatingFileHandler`) — no external
+`logrotate` needed. It also means one process per log directory: two processes writing the
+same file will fight over each other's rotation.
+
+Two things worth knowing:
+
+- third-party logs (`httpx`, `openai`, `langchain`) land in the same file, through the same
+  rotation, because everything is funnelled through the standard library;
+- the log directory is deliberately **not** inside `./workspace/`. That directory is the
+  agent's sandbox — it should not be able to read, or edit, the record of its own actions.
+
 ---
 
 ## ⚠️ Safety note

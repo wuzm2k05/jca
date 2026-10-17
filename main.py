@@ -8,6 +8,7 @@ from langgraph.graph import START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.types import Command
 
+from logger import get_logger, setup_logging
 from prompts import build_system_prompt
 from safety import MAX_SAFETY_RETRIES, build_retry_message, is_safety_block
 from tools import build_tools
@@ -15,6 +16,14 @@ from tools.sandbox import WORKSPACE
 
 # 在程序最开始加载 .env 文件的环境变量
 load_dotenv()
+
+# 然后立刻装配日志 —— 早于任何一次日志调用，也早于下面这些模块真正开始干活。
+# 之后所有模块都从 logger 包取 logger，项目里不再有 print。
+setup_logging()
+
+# 每个模块顶部都这么写一行：__name__ 会变成日志里的 logger 字段，
+# 出问题时一眼就能看出是哪一层在说话
+logger = get_logger(__name__)
 
 
 # 1. 取本次运行可用的工具
@@ -57,7 +66,7 @@ def agent_node(state: AgentState):
         # 必须设上限。判定的对象是**整个请求体**，而我们只是往里追加了一条消息，
         # 触发它的那段历史原封不动还在——所以重试经常救不回来，不加限制就是死循环。
         if retries >= MAX_SAFETY_RETRIES:
-            print(f"=== 连续 {retries} 次被内容判定拦下，放弃重试 ===")
+            logger.error("连续被内容判定拦下，放弃重试", retries=retries)
             raise
 
         # 把这次「拒绝」包成一条 HumanMessage 放回对话，再回到自己重来一次。
@@ -65,7 +74,7 @@ def agent_node(state: AgentState):
         # 为什么用 Command 而不是普通 return：普通 return 之后由 tools_condition
         # 决定下一步，而它会看到最后一条是没有工具申请的 HumanMessage —— 图会直接
         # 结束，回不到 agent。Command(goto=...) 是节点自己指定下一步，能绕开条件边。
-        print(f"=== 被内容判定拦下，第 {retries + 1} 次重试 ===")
+        logger.warning("被内容判定拦下，准备重试", attempt=retries + 1, limit=MAX_SAFETY_RETRIES)
         return Command(
             goto="agent",
             update={
@@ -108,9 +117,10 @@ if __name__ == "__main__":
         ]
     }
 
-    print(f"=== 工作目录: {WORKSPACE} ===")
-    print(f"=== 可用工具: {[t.name for t in tools]} ===")
-    print(f"=== 用户指令: {prompt} ===\n")
+    logger.info("本次运行开始", workspace=str(WORKSPACE), tools=[t.name for t in tools], prompt=prompt)
     for chunk in app.stream(inputs, stream_mode="values"):
         latest_msg = chunk["messages"][-1]
-        latest_msg.pretty_print()
+        # pretty_print() 是往标准输出直接打印的，绕不进日志（拿不到结构、也没法落盘），
+        # 所以改用 pretty_repr() 取到文本，再交给 logger。
+        # 落进文件时它就是一个 message 字段，换行会被 JSON 转义成 \n，一行一条不乱。
+        logger.info("对话更新", message=latest_msg.pretty_repr())
