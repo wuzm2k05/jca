@@ -235,3 +235,7 @@ knowing:
 **Run it on a disposable machine or a container.** Do not point it at a machine holding
 real credentials or data. Expect the code to ask you to make it safer; that is part of the
 exercise — the pieces are deliberately small enough to read and change.
+
+
+## installer
+uv run pyinstaller --onefile --name jca src/jca/main.py
