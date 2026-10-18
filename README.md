@@ -1,6 +1,6 @@
 # jca-simple
 
-A runnable **ReAct agent** built with **LangGraph + LangChain**.
+A runnable **ReAct coding agent** built with **LangGraph + LangChain**.
 
 This repository is the teaching material for a short course on how agents work. Lessons
 are delivered as git tags, so the same repository shows you the project at every stage of
