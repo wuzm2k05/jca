@@ -4,6 +4,7 @@
 
 from .guard import (
     MAX_SAFETY_RETRIES,
+    RETRY_NOTE,
     SAFETY_CODE,
     build_retry_message,
     is_safety_block,
@@ -11,6 +12,7 @@ from .guard import (
 
 __all__ = [
     "MAX_SAFETY_RETRIES",
+    "RETRY_NOTE",
     "SAFETY_CODE",
     "build_retry_message",
     "is_safety_block",

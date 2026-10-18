@@ -1,131 +1,125 @@
+"""组装点（Composition Root）：把 engine 和 ui 接在一起，然后启动。
+
+这个文件刻意不做任何 Agent 的事 —— 建工具、建模型、建图都在 engine/ 里，
+画界面都在 ui/ 里。这里只剩下「按什么顺序装、按什么参数装」：
+
+    load_dotenv()  →  选日志出口  →  setup_logging()  →  argparse
+                                      ↓
+                           JCAEngine ──► ui.run_interactive / ui.run_once
+
+不用 `if __name__ == "__main__"` 里再写一段演示 prompt：想跑一轮就用
+`--prompt`，那才是给脚本和演示留的入口。
+"""
+
+import argparse
 import os
+import sys
 
 from dotenv import load_dotenv
-from langchain_core.exceptions import ModelInvalidRequestError
-from langchain_core.messages import SystemMessage
-from langchain_openai import ChatOpenAI
-from langgraph.graph import START, MessagesState, StateGraph
-from langgraph.prebuilt import ToolNode, tools_condition
-from langgraph.types import Command
 
-from logger import get_logger, setup_logging
-from prompts import build_system_prompt
-from safety import MAX_SAFETY_RETRIES, build_retry_message, is_safety_block
-from tools import build_tools
-from tools.sandbox import workspace_root
+from engine import DEFAULT_MODEL, JCAEngine
+from logger import LogConfig, LogTarget, get_logger, setup_logging
+from logger.config import ENV_PREFIX
+from ui import make_console, run_interactive, run_once
 
 # 在程序最开始加载 .env 文件的环境变量
 load_dotenv()
 
-# 然后立刻装配日志 —— 早于任何一次日志调用，也早于下面这些模块真正开始干活。
-# 之后所有模块都从 logger 包取 logger，项目里不再有 print。
-setup_logging()
-
-# 每个模块顶部都这么写一行：__name__ 会变成日志里的 logger 字段，
-# 出问题时一眼就能看出是哪一层在说话
 logger = get_logger(__name__)
 
 
-# 1. 取本次运行可用的工具
-#    注意：这里 tools 指的是工具列表，不是上面 import 的 tools 包
-tools = build_tools()
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="jca",
+        description="一个本地编程 agent。不带参数就是交互式会话。",
+    )
+    # 位置参数是「顺手跑一句」，--prompt 是「明说要跑一句」。两个都留，
+    # 因为引号在 Windows 的 cmd 里很烦，多一条路少一次踩坑。
+    parser.add_argument(
+        "prompt_positional",
+        nargs="?",
+        metavar="PROMPT",
+        help="跑完这一句就退出（等价于 --prompt）。",
+    )
+    parser.add_argument(
+        "-p",
+        "--prompt",
+        help="跑完这一句就退出，不进交互式界面。给脚本用。",
+    )
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help=f"模型名（默认 {DEFAULT_MODEL}）。",
+    )
+    parser.add_argument(
+        "--no-color",
+        action="store_true",
+        help="关掉颜色（重定向到文件、或者终端配色不兼容时用）。",
+    )
+    return parser.parse_args(argv)
 
 
-# 2. 初始化 DeepSeek 模型并绑定工具
-llm = ChatOpenAI(
-    model="DeepSeek-V4.1-Flash",
-    # 此时会自动从 .env 读取 DEEPSEEK_API_KEY
-    api_key=os.getenv("DEEPSEEK_API_KEY"),
-    base_url=os.getenv("DEEPSEEK_API_BASE_URL", "https://api.deepseek.ai"),
-    temperature=0,
-).bind_tools(tools)
+def _setup_logging(*, interactive: bool) -> LogConfig:
+    """选日志出口，然后装配。
 
+    为什么要在装配**之前**做这个判断：交互式界面（rich 的 Live）和终端日志
+    都要在 sys.stdout 上做光标定位，两边同时写会花屏。所以在交互模式下把
+    日志默认挪进文件。
 
-# 3. 定义状态：消息列表之外，多记一个「连续被拦了几次」
-class AgentState(MessagesState):
-    """MessagesState 只声明了 messages，这里再加一个计数字段。
-
-    没给它配 reducer，所以是「后写覆盖先写」，每次进节点读到的都是最新值。
+    三档，按优先级：
+      1. 用户显式设过 JCA_LOG_TARGET —— 尊重他的选择，只提醒一句（见返回值
+         之外的 warning，由 main() 传给界面）；
+      2. 没设过 + 交互模式 —— 默认 file；
+      3. 没设过 + --prompt 模式 —— 保持原来的默认（console），一次性运行的
+         输出跟以前一模一样。
     """
+    explicit = bool(os.getenv(ENV_PREFIX + "LOG_TARGET", "").strip())
+    default_target = LogTarget.FILE if (interactive and not explicit) else None
+    return setup_logging(LogConfig.from_env(default_target=default_target))
 
-    safety_retries: int
+
+def _log_note(config: LogConfig) -> str:
+    """横幅上「日志去哪儿了」那句话。"""
+    if config.target in (LogTarget.FILE, LogTarget.BOTH):
+        return str(config.file_path)
+    return "终端（和界面共用终端）"
 
 
-# 4. 定义 Agent 节点
-def agent_node(state: AgentState):
-    retries = state.get("safety_retries", 0)
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+    prompt = args.prompt or args.prompt_positional
+    interactive = prompt is None
 
-    try:
-        response = llm.invoke(state["messages"])
-    except ModelInvalidRequestError as e:
-        # 服务端对**整个请求体**做内容判定，命中就返回 400。
-        # 不是内容问题就照原样抛出去（认证失败、限流那些本来也不是这个异常，
-        # 而「工具参数写错了」虽然同样是 400，但换措辞永远修不好，所以还要认判定码）。
-        if not is_safety_block(e):
-            raise
-        # 必须设上限。判定的对象是**整个请求体**，而我们只是往里追加了一条消息，
-        # 触发它的那段历史原封不动还在——所以重试经常救不回来，不加限制就是死循环。
-        if retries >= MAX_SAFETY_RETRIES:
-            logger.error("连续被内容判定拦下，放弃重试", retries=retries)
-            raise
+    config = _setup_logging(interactive=interactive)
 
-        # 把这次「拒绝」包成一条 HumanMessage 放回对话，再回到自己重来一次。
-        #
-        # 为什么用 Command 而不是普通 return：普通 return 之后由 tools_condition
-        # 决定下一步，而它会看到最后一条是没有工具申请的 HumanMessage —— 图会直接
-        # 结束，回不到 agent。Command(goto=...) 是节点自己指定下一步，能绕开条件边。
-        logger.warning("被内容判定拦下，准备重试", attempt=retries + 1, limit=MAX_SAFETY_RETRIES)
-        return Command(
-            goto="agent",
-            update={
-                "messages": [build_retry_message()],
-                "safety_retries": retries + 1,
-            },
+    # 用户把日志留在了终端上：不拦，只提醒一次。花屏很烦，但比起「用户配好的
+    # 东西被程序偷偷改掉」，前者是可恢复的。
+    warning = None
+    if interactive and config.target in (LogTarget.CONSOLE, LogTarget.BOTH):
+        warning = (
+            f"{ENV_PREFIX}LOG_TARGET={config.target.value} 时日志会和界面抢光标，"
+            f"输出可能错位。设成 file 可以避开。"
         )
 
-    # 这一轮成功了就清零：重试额度按「连续被拦」算，不是按累计次数算
-    return {"messages": [response], "safety_retries": 0}
-
-
-# 5. 构建 ReAct 状态图
-workflow = StateGraph(AgentState)
-
-workflow.add_node("agent", agent_node)
-workflow.add_node("tools", ToolNode(tools))
-
-workflow.add_edge(START, "agent")
-workflow.add_conditional_edges(
-    "agent",
-    tools_condition,
-)
-workflow.add_edge("tools", "agent")
-
-app = workflow.compile()
-
-
-# 6. 测试运行
-if __name__ == "__main__":
-    prompt = (
-        "在 hello_world 目录下创建 app.py，内容是 print('Hello from DeepSeek!')，并且运行确保结果正确"
-    )
-
-    # 系统提示里带上操作系统和工作目录，模型就不用猜自己在哪台机器上
-    inputs = {
-        "messages": [
-            SystemMessage(content=build_system_prompt()),
-            ("user", prompt),
-        ]
-    }
-
     logger.info(
-        "本次运行开始",
-        workspace=str(workspace_root()),
-        tools=[t.name for t in tools],
-        prompt=prompt,
+        "启动",
+        mode="interactive" if interactive else "once",
+        model=args.model,
+        log_target=config.target.value,
     )
-    for chunk in app.stream(inputs, stream_mode="values"):
-        latest_msg = chunk["messages"][-1]
-        # pretty_print() 是往标准输出直接打印的，绕不进日志（拿不到结构、也没法落盘），
-        # 所以改用 pretty_repr() 取到文本，再交给 logger。
-        # 落进文件时它就是一个 message 字段，换行会被 JSON 转义成 \n，一行一条不乱。
-        logger.info("对话更新", message=latest_msg.pretty_repr())
+
+    console = make_console(no_color=args.no_color)
+    engine = JCAEngine(model=args.model)
+
+    if interactive:
+        return run_interactive(
+            engine,
+            console=console,
+            log_note=_log_note(config),
+            warning=warning,
+        )
+    return run_once(engine, prompt, console=console)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

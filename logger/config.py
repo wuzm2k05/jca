@@ -68,10 +68,19 @@ class LogConfig:
         return (Path.cwd() / self.log_dir / self.file_name).resolve()
 
     @classmethod
-    def from_env(cls) -> "LogConfig":
-        """从环境变量读一份配置，没设的项用默认值。"""
+    def from_env(cls, default_target: LogTarget | None = None) -> "LogConfig":
+        """从环境变量读一份配置，没设的项用默认值。
+
+        default_target 是给**调用方**用的兜底出口，只在这一项没被环境变量
+        设过时生效。谁会用到：交互式 CLI。它用 rich 的 Live 在 sys.stdout 上
+        做光标定位，而终端日志走的是裸 sys.stdout.write，两边的光标会互相踩，
+        输出会花掉——所以 CLI 把默认出口换成文件（详见 ui/cli.py 的说明）。
+
+        为什么是「兜底」而不是「覆盖」：用户如果显式写了 JCA_LOG_TARGET，
+        那是他的决定，代码不该替他改，只该在他选的出口有代价时提醒一句。
+        """
         return cls(
-            target=_env_target(),
+            target=_env_target(default_target),
             level=resolve_level_name(os.getenv(ENV_PREFIX + "LOG_LEVEL", DEFAULT_LEVEL)),
             log_dir=Path(os.getenv(ENV_PREFIX + "LOG_DIR", DEFAULT_LOG_DIR)),
             file_name=os.getenv(ENV_PREFIX + "LOG_FILE", DEFAULT_FILE_NAME),
@@ -98,8 +107,17 @@ def level_value(name: str) -> int:
     return logging.getLevelNamesMapping()[resolve_level_name(name)]
 
 
-def _env_target() -> LogTarget:
-    raw = os.getenv(ENV_PREFIX + "LOG_TARGET", DEFAULT_TARGET.value).strip().lower()
+def _env_target(default: LogTarget | None = None) -> LogTarget:
+    """读 JCA_LOG_TARGET；没设就用 default（再没有就用模块默认值）。
+
+    不认识的**值**要抛错，和 resolve_level_name 一个道理：把 console 拼成
+    consle，后果是「日志哪儿都没有，而且没人告诉你」。但「这一项没设」不是
+    错误，只是用默认值。
+    """
+    raw = os.getenv(ENV_PREFIX + "LOG_TARGET")
+    if raw is None or not raw.strip():
+        return default if default is not None else DEFAULT_TARGET
+    raw = raw.strip().lower()
     try:
         return LogTarget(raw)
     except ValueError:

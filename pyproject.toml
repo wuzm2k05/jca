@@ -10,6 +10,7 @@ dependencies = [
     "langchain-openai>=1.7.1",
     "langgraph>=1.2.15",
     "python-dotenv>=1.2.4",
+    "rich>=15.0.0",
     "structlog>=26.1.0",
 ]
 

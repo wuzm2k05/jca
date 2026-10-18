@@ -100,8 +100,90 @@ Two things worth checking if the program can't reach the model:
 ### Run
 
 ```bash
-uv run main.py
+uv run main.py                       # interactive session
+uv run main.py --prompt "..."        # run one turn and exit
 ```
+
+See the next section for what the interactive session looks like.
+
+### The interactive CLI
+
+`uv run main.py` with no arguments drops you into a session. It is a thin terminal
+front end over the same engine `--prompt` uses — the agent loop, the tools and the
+sandbox are unchanged; only the presentation differs.
+
+```
+┌──────────────────────────────── jca ────────────────────────────────┐
+│ 模型  DeepSeek-V4.1-Flash                                           │
+│ 工作目录  D:\work\src\jca-simple\workspace                          │
+│ 日志  D:\work\src\jca-simple\logs\jca.log                           │
+└──────────────── Ctrl-C 中断本轮（在提示符处则退出）· /exit 退出 ────┘
+› 在 workspace 里建一个 hello.py，打印 Hello，然后运行它
+
+  ● write_file(path=hello.py)
+    ⎿ 已新建 hello.py，共写入 15 个字符。
+  ● run_cmd(command=python hello.py)
+    ⎿ Hello
+
+⏺ 已完成：脚本已创建并运行，输出是 Hello
+›
+```
+
+**Reading the marks:**
+
+| Mark | Meaning |
+| --- | --- |
+| `›` | your prompt |
+| `⏺` | the model talking (rendered as Markdown) |
+| `●` | the model *asked* for a tool — name and arguments, one line |
+| `⎿` | what the tool returned (truncated — the full output is in the log file) |
+| `⚠` | a notice, e.g. the request was blocked by the server's content filter and is being retried |
+
+The two marks in the middle are the whole point of the section on deciding vs doing:
+`●` is a *request*, written by the model; `⎿` is the *result*, produced by your own
+code. They never merge into one line.
+
+**Commands.** `/exit`, `/quit` and `/q` all leave. `Ctrl-C` interrupts the turn in
+progress and keeps the session; at the prompt it exits. `Ctrl-D` (or the end of piped
+input) exits too. There is no `/help` and no history/completion — no raw-mode terminal
+handling, so nothing to go wrong on Windows consoles. Feel free to add them.
+
+**Multi-turn memory** is kept by the graph's checkpointer, keyed on a `thread_id` — the
+UI itself stores no history. Everything you said earlier in the session is visible to
+the model, including files it wrote (it reads them back with `read_file` rather than
+remembering their contents).
+
+**Symbols and old terminals.** On a console that cannot show `⏺`/`⎿` (a GBK code page
+in `cmd.exe`, for instance) set `JCA_ASCII=1` and they degrade to `>`, `-`, `!`:
+
+```bash
+JCA_ASCII=1 uv run main.py
+```
+
+**`--prompt` is deliberately plainer.** One turn, no re-drawing, no colour, no Markdown
+— just the answer, the tool lines and the results. That is what you want when the output
+is being piped into a file or read by a script. It exits `0` on success and `1` if the
+turn failed, so `&&` chains work. Logs still go to the terminal here, as they always did,
+so a failing turn shows a stack trace above the one-line error — set
+`JCA_LOG_TARGET=file` if you would rather it did not.
+
+**Why the logs move to a file here.** The terminal logger writes to `sys.stdout` directly,
+and the live display needs to own `sys.stdout` to redraw in place; both at once gives you
+garbled output. So in interactive mode the log target **defaults to `file`** — the banner
+tells you where it went, because "my logs disappeared" is harder to diagnose than "the
+output looks scrambled". An explicit `JCA_LOG_TARGET` is never overridden: if you set it
+to `console` or `both`, that is honoured and you get a one-line warning instead. Under
+`--prompt` nothing changes — there is no live display there, so logs still go to the
+terminal by default.
+
+**Two known rough edges**, both consequences of the design rather than bugs:
+
+- a turn that fails (network error, safety block) leaves your message in the session
+  history, so the next turn may see two consecutive user messages;
+- Ctrl-C during a turn keeps whatever was already printed, but the interrupted turn does
+  not resume.
+
+---
 
 ### Logging
 
@@ -122,12 +204,18 @@ key, or set them in the shell):
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `JCA_LOG_TARGET` | `console` | `console`, `file`, or `both` |
+| `JCA_LOG_TARGET` | `console` (`file` in the interactive CLI) | `console`, `file`, or `both` |
 | `JCA_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, … |
 | `JCA_LOG_DIR` | `logs` | directory for log files, relative to the working directory |
 | `JCA_LOG_FILE` | `jca.log` | file name |
 | `JCA_LOG_MAX_BYTES` | `10485760` | rotate once a file passes this size (10 MB) |
 | `JCA_LOG_BACKUP_COUNT` | `5` | how many rotated files to keep |
+
+That default is the only place the two modes differ: without `JCA_LOG_TARGET` set, an
+interactive session logs to `logs/jca.log` and `--prompt` logs to the terminal. Set the
+variable and it means exactly what it says in both. The reason is in
+[the CLI section](#the-interactive-cli) — the live display and a terminal logger
+fight over the same cursor.
 
 ```bash
 # macOS / Linux — write to both the terminal and ./logs/
@@ -201,6 +289,33 @@ creating it — where commands run is your decision, not a side effect.
 
 ---
 
+## 5. Tests
+
+`tests/` holds two offline suites. Neither needs an API key or a terminal, and neither
+needs pytest — they are plain functions with a `main()`:
+
+```bash
+uv run python -m tests.test_engine_events    # the agent loop, against a scripted model
+uv run python -m tests.test_ui_transcript    # events in, rendered text out
+```
+
+They exist because of how this project is split. The engine takes a `BaseChatModel` as a
+constructor argument, so a fake model that emits hand-written chunks can drive the real
+`StateGraph`, the real `ToolNode` and the real translation layer end to end — no network,
+no cost. That is what pins down the parts that are easy to get wrong and hard to see:
+that tool arguments come from the parsed message rather than self-assembled chunks, that
+the safety retry note is turned into a status line instead of fake assistant text, and
+that a failed call becomes an error event rather than a stack trace on the user's screen.
+
+The UI suite feeds synthetic events into the same function the live display uses. What it
+checks is that each event lands somewhere sensible — a tool result attaches to its call,
+a multi-line result is folded, an unknown event type is ignored rather than crashing.
+
+If you prefer pytest, they are named to be collected (`uv add --dev pytest`):
+`uv run pytest tests/`.
+
+---
+
 ## ⚠️ Safety note
 
 The agent's file tools — `list_dir`, `read_file`, `write_file`, `edit_file` — are confined
@@ -238,4 +353,4 @@ exercise — the pieces are deliberately small enough to read and change.
 
 
 ## installer
-uv run pyinstaller --onefile --name jca src/jca/main.py
+uv run pyinstaller jca.spec
