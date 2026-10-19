@@ -143,6 +143,27 @@ The two marks in the middle are the whole point of the section on deciding vs do
 `●` is a *request*, written by the model; `⎿` is the *result*, produced by your own
 code. They never merge into one line.
 
+**The tools** are the whole of what the agent can do (`tools/files.py`, `tools/shell.py`):
+
+| Tool | What it does |
+| --- | --- |
+| `list_dir(path=".", max_depth=2)` | lists a directory tree, indented, skipping `.git`, `.venv`, `node_modules`, `__pycache__`, `dist`, `build`, `.idea`, `.vscode` |
+| `find_files(pattern="*", path=".")` | recursive wildcard search — `*.py`, `*auth*`, `tools/*.py` — same skip list, first 100 matches |
+| `read_file(path, start_line=1, line_count=None)` | reads a file with a line-number column, in slices if you ask for them |
+| `write_file(path, content)` | creates or overwrites |
+| `edit_file(path, old_text, new_text)` | one exact-string replacement |
+| `replace_lines(path, start_line, end_line, new_content)` | replaces an inclusive line range, by the numbers `read_file` printed |
+| `run_cmd(command)` | one command, in the workspace root |
+
+`read_file` and `replace_lines` are deliberately numbered the same way, so the model can
+read lines 200-260, decide what is wrong, and write that range back without ever pasting
+the text it wants to match. That pairing is what makes long files work: a file too big for
+one read comes back as "this chunk ends at line 199, continue with `start_line=200`"
+instead of the old silent truncation, and a fifty-line function can be replaced without a
+single whitespace mismatch. New content is written back in the file's own encoding and
+line-ending style, and an out-of-range line number is refused rather than clamped — a
+silently short edit is much harder to notice than an error message.
+
 **Commands.** `/exit`, `/quit` and `/q` all leave. `Ctrl-C` interrupts the turn in
 progress and keeps the session; at the prompt it exits. `Ctrl-D` (or the end of piped
 input) exits too. There is no `/help` and no history/completion — no raw-mode terminal
@@ -291,12 +312,13 @@ creating it — where commands run is your decision, not a side effect.
 
 ## 5. Tests
 
-`tests/` holds two offline suites. Neither needs an API key or a terminal, and neither
+`tests/` holds three offline suites. None needs an API key or a terminal, and none
 needs pytest — they are plain functions with a `main()`:
 
 ```bash
 uv run python -m tests.test_engine_events    # the agent loop, against a scripted model
 uv run python -m tests.test_ui_transcript    # events in, rendered text out
+uv run python -m tests.test_tools            # the file and shell tools, against real temp dirs
 ```
 
 They exist because of how this project is split. The engine takes a `BaseChatModel` as a
@@ -311,6 +333,17 @@ The UI suite feeds synthetic events into the same function the live display uses
 checks is that each event lands somewhere sensible — a tool result attaches to its call,
 a multi-line result is folded, an unknown event type is ignored rather than crashing.
 
+The tools suite is the one that touches a disk, so it works in a temporary directory it
+creates **inside** the working directory and deletes afterwards — `safe_path` only allows
+paths under the workspace, so a system temp directory would be testing something the agent
+can never do. It plants a small tree with a nested package and a `.git`/`.venv` decoy in
+it, and checks the things that fail quietly: that the ignored names really are gone from
+the listing (and that "the directory is empty" and "everything in it was ignored" are
+reported as two different things), that `start_line`/`line_count` slices line up with the
+numbers `replace_lines` takes, that a CRLF + GBK file survives a line edit unchanged
+otherwise, that an out-of-range edit leaves the file untouched, and that `ls ../..`,
+`cat /etc/passwd` and `type C:\Windows\...` are all refused while `dir /s` is not.
+
 If you prefer pytest, they are named to be collected (`uv add --dev pytest`):
 `uv run pytest tests/`.
 
@@ -318,9 +351,9 @@ If you prefer pytest, they are named to be collected (`uv add --dev pytest`):
 
 ## ⚠️ Safety note
 
-The agent's file tools — `list_dir`, `read_file`, `write_file`, `edit_file` — are confined
-to the workspace. Every path is resolved and checked before use, so `../.env` and
-`C:\Windows\...` are both refused.
+The agent's file tools — `list_dir`, `find_files`, `read_file`, `write_file`, `edit_file`,
+`replace_lines` — are confined to the workspace. Every path is resolved and checked before
+use, so `../.env` and `C:\Windows\...` are both refused.
 
 **The default root is the directory you run from**, so out of the box the agent can read and
 write your project files, `main.py` included. Set `JCA_WORKSPACE=workspace` to give it its
@@ -339,11 +372,22 @@ redirects and `&&` are rejected with an explanation, so the model cannot chain i
 around the sandbox. It also reports the exit code, so a silent failure no longer looks like
 success.
 
-**This is not a complete sandbox, and it does not pretend to be.** Two limits are worth
+Its arguments are checked against the workspace too: a token that is an absolute path
+(`/etc/passwd`, `C:\Windows\win.ini`, `\\server\share`) or that climbs out with `..`
+(`ls ../..`) is refused before anything runs, because `cwd=root` only decides where the
+command *starts* — it cannot stop the command naming an absolute path itself.
+
+**This is not a complete sandbox, and it does not pretend to be.** Three limits are worth
 knowing:
 
-- the path check covers the file tools only. With `JCA_ALLOW_SHELL=1`, an absolute path
-  inside a command (`type C:\Windows\...`) can still step outside the workspace;
+- the command check is **lexical**, done on the raw text before the shell ever sees it, so
+  it catches the obvious spellings and nothing else. `python -c "open('/etc/passwd')"` gets
+  through, and so does any path the command assembles at runtime. It is a guard-rail against
+  a model wandering out by accident, not a boundary against one trying to;
+- one deliberate gap in that check: a single-segment `/name` is treated as an option, not a
+  path, so `dir /s` and `tasklist /fi ...` keep working on Windows — at the cost of `/tmp`
+  slipping through. Refusing every leading `/` would have made the tool nearly unusable on
+  the platform where the `/` option prefix is normal;
 - the confinement is path-level, not permission-level — no process isolation, no resource
   limits, no human approval step.
 
