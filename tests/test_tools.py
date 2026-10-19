@@ -15,10 +15,13 @@
 测试要跑的正是这条真实路径，不能绕开它。
 """
 
+import os
 import shutil
 import sys
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
 from langchain_core.tools import BaseTool
 
@@ -34,7 +37,15 @@ from tools.files import (
     write_file,
 )
 from tools.sandbox import workspace_root
-from tools.shell import check_path_escape, run_cmd
+from tools.shell import (
+    CMD_LOG_RELPATH,
+    HEAD_CHARS,
+    MAX_OUTPUT_CHARS,
+    TAIL_CHARS,
+    _format_and_persist_output,
+    check_path_escape,
+    run_cmd,
+)
 
 
 def _call(tool: BaseTool, **kwargs) -> str:
@@ -55,6 +66,22 @@ class _Sandbox:
 
     def __exit__(self, *exc) -> None:
         shutil.rmtree(self.root, ignore_errors=True)
+
+
+@contextmanager
+def _cwd(path: Path) -> Iterator[Path]:
+    """临时把当前目录切到 path，出来再切回去。
+
+    run_cmd 的 cwd 和 .jca/logs 的落点都是**运行时**按当前目录算的
+    （见 tools/sandbox.py 的 workspace_root），所以在沙箱里跑一条真命令，
+    只能在进程级把 cwd 切过去 —— 这也是真实使用时发生的事。
+    """
+    previous = Path.cwd()
+    os.chdir(path)
+    try:
+        yield path
+    finally:
+        os.chdir(previous)
 
 
 def _rel(path: Path) -> str:
@@ -359,8 +386,80 @@ def test_run_cmd_refuses_escape_and_still_runs_inside() -> None:
         (root / "hello.txt").write_text("hi\n", encoding="utf-8")
         # `echo` 在 cmd.exe 和 sh 里都有，是最不容易受平台影响的探针
         assert check_single_command("echo hi") is None
-        out = _call(run_cmd, command="echo hi")
+        with _cwd(root):
+            out = _call(run_cmd, command="echo hi")
         assert "hi" in out, out
+
+
+# —— 超长命令输出：头 + 尾截断 + 完整落地 ————————————————————————
+def test_short_output_is_returned_untouched() -> None:
+    """没超上限就原样返回，也不落文件 —— 别为了「统一」给短输出也写一份。"""
+    with _Sandbox() as root, _cwd(root):
+        text = "x" * MAX_OUTPUT_CHARS
+        assert _format_and_persist_output("echo", text) == text
+        assert not (root / CMD_LOG_RELPATH).exists()
+
+
+def test_long_output_keeps_head_and_tail() -> None:
+    """长的：头一段 + 省略提示 + 尾一段。
+
+    头尾都要断言 —— 这个功能的意义就在尾巴上（Traceback 和退出码压在那里），
+    只测「长度变短了」等于没测：从末尾砍掉同样能让长度变短。
+    """
+    with _Sandbox() as root, _cwd(root):
+        raw = "HEAD-MARK" + "x" * (MAX_OUTPUT_CHARS * 2) + "TAIL-TRACEBACK"
+        out = _format_and_persist_output("python big.py", raw)
+
+        assert out.startswith(raw[:HEAD_CHARS]), out[:80]
+        assert out.endswith(raw[-TAIL_CHARS:]), out[-80:]
+        assert f"中间省略 {len(raw) - HEAD_CHARS - TAIL_CHARS} 字符" in out, out
+        assert CMD_LOG_RELPATH.as_posix() in out, out
+        assert len(out) < len(raw), (len(out), len(raw))
+
+
+def test_long_output_persists_the_full_text_not_the_slices() -> None:
+    """落地的必须是**完整原文**。存截断后的两段，模型 read_file 回来还是残缺的。"""
+    with _Sandbox() as root, _cwd(root):
+        raw = "".join(f"line {i:04d}\n" for i in range(1000))
+        _format_and_persist_output("pytest", raw)
+
+        saved = (root / CMD_LOG_RELPATH).read_text(encoding="utf-8")
+        assert saved == raw, (len(saved), len(raw))
+
+
+def test_run_cmd_applies_truncation_and_round_trips_via_read_file() -> None:
+    """端到端：命令 → 截断后的结果里有提示 → 按提示用 read_file 能读到全文。
+
+    这条把两个工具对上了：提示语里的那个路径必须真的是 read_file 能打开的路径。
+    写错一个字符，模型就会照着提示去读一个不存在的文件。
+    """
+    with _Sandbox() as root, _cwd(root):
+        out = _call(run_cmd, command='python -c "print(\'A\' * 5000)"')
+
+        assert "中间省略" in out, out
+        assert len(out) < 5000, len(out)
+        assert "AAAA" in out, out
+
+        # 提示语里的相对路径直接喂给 read_file（不是自己拼一个）
+        assert CMD_LOG_RELPATH.as_posix() in out, out
+        full = _call(read_file, path=CMD_LOG_RELPATH.as_posix())
+        assert full.count("A") >= 5000, full[:200]
+
+
+def test_persist_failure_still_returns_a_usable_answer() -> None:
+    """写不进日志文件时：命令结果照样返回，提示语也不能撒谎说「已保存」。
+
+    用「把 .jca 占成一个文件」来制造失败 —— 比改权限可靠，而且跨平台。
+    """
+    with _Sandbox() as root, _cwd(root):
+        (root / ".jca").write_text("占位，让 mkdir 失败\n", encoding="utf-8")
+        raw = "b" * (MAX_OUTPUT_CHARS + 100)
+
+        out = _format_and_persist_output("python big.py", raw)
+        assert "保存失败" in out, out
+        assert "已保存至" not in out, out
+        # 头尾还在，模型至少能看到末尾的报错
+        assert out.endswith(raw[-TAIL_CHARS:]), out[-80:]
 
 
 # —— 注册表 ————————————————————————————————————————————————
@@ -395,6 +494,11 @@ def main() -> int:
         test_check_path_escape_blocks_leaving_paths,
         test_check_path_escape_allows_paths_inside,
         test_run_cmd_refuses_escape_and_still_runs_inside,
+        test_short_output_is_returned_untouched,
+        test_long_output_keeps_head_and_tail,
+        test_long_output_persists_the_full_text_not_the_slices,
+        test_run_cmd_applies_truncation_and_round_trips_via_read_file,
+        test_persist_failure_still_returns_a_usable_answer,
         test_new_tools_are_registered,
     ]
     failed = 0

@@ -153,7 +153,7 @@ code. They never merge into one line.
 | `write_file(path, content)` | creates or overwrites |
 | `edit_file(path, old_text, new_text)` | one exact-string replacement |
 | `replace_lines(path, start_line, end_line, new_content)` | replaces an inclusive line range, by the numbers `read_file` printed |
-| `run_cmd(command)` | one command, in the workspace root |
+| `run_cmd(command)` | one command, in the workspace root; output over 2000 chars comes back head+tail, with the full text in `.jca/logs/cmd_last.log` |
 
 `read_file` and `replace_lines` are deliberately numbered the same way, so the model can
 read lines 200-260, decide what is wrong, and write that range back without ever pasting
@@ -163,6 +163,16 @@ instead of the old silent truncation, and a fifty-line function can be replaced 
 single whitespace mismatch. New content is written back in the file's own encoding and
 line-ending style, and an out-of-range line number is refused rather than clamped — a
 silently short edit is much harder to notice than an error message.
+
+`run_cmd` handles the same problem on the command side. A build log or a test run can be
+tens of thousands of characters, and the part that matters — the traceback, the exit-code
+line — is at the *end*. So anything over `MAX_OUTPUT_CHARS` is returned as its first 500
+and last 1500 characters joined by a `... [中间省略 N 字符] ...` marker, and the
+untruncated text is written to `.jca/logs/cmd_last.log` inside the workspace so the model
+can `read_file` it. That path is inside the sandbox on purpose: the notice tells the model
+to read it, and a file it cannot reach would just be a dead end. If the write fails
+(read-only directory, permissions), the command result is still returned — with a notice
+that says so rather than pointing at a file that is not there.
 
 **Commands.** `/exit`, `/quit` and `/q` all leave. `Ctrl-C` interrupts the turn in
 progress and keeps the session; at the prompt it exits. `Ctrl-D` (or the end of piped
@@ -341,8 +351,11 @@ it, and checks the things that fail quietly: that the ignored names really are g
 the listing (and that "the directory is empty" and "everything in it was ignored" are
 reported as two different things), that `start_line`/`line_count` slices line up with the
 numbers `replace_lines` takes, that a CRLF + GBK file survives a line edit unchanged
-otherwise, that an out-of-range edit leaves the file untouched, and that `ls ../..`,
-`cat /etc/passwd` and `type C:\Windows\...` are all refused while `dir /s` is not.
+otherwise, that an out-of-range edit leaves the file untouched, that `ls ../..`,
+`cat /etc/passwd` and `type C:\Windows\...` are all refused while `dir /s` is not, and
+that a long command's output keeps both its head and its tail while the saved file holds
+the whole thing — the tail assertion is the one that matters, since trimming from the
+end would satisfy "it got shorter" just as well.
 
 If you prefer pytest, they are named to be collected (`uv add --dev pytest`):
 `uv run pytest tests/`.

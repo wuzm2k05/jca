@@ -5,7 +5,7 @@ from langchain_core.tools import tool
 
 from logger import get_logger
 
-from .sandbox import workspace_root
+from .sandbox import safe_path, workspace_root
 
 logger = get_logger(__name__)
 
@@ -16,6 +16,29 @@ TIMEOUT_SECONDS = 60
 
 # 路径里用来分层的字符。Windows 两种都认，所以两种都要看。
 _PATH_SEPARATORS = "/\\"
+
+# —— 输出长度控制 ————————————————————————————————————————————
+#
+# 命令输出是没有上限的：一次编译、一次测试、一次 Schema 校验，几千上万字符很常见。
+# 全量塞回对话会瞬间吃掉大量 token，甚至把上下文撑爆；而**从末尾砍掉**更糟 ——
+# 真正有用的 Traceback 和错误总结恰恰压在最后几行。
+#
+# 所以超长时改成「头 + 尾」：头部留着命令的启动信息，尾部留着报错，
+# 中间那段省略掉，同时把完整输出落到文件里 —— 需要时模型自己用 read_file 去读。
+#
+# 输出上限阈值：超过它就触发截断
+MAX_OUTPUT_CHARS = 2000
+# 截断时保留的头部长（命令启动、环境信息在这里）
+HEAD_CHARS = 500
+# 截断时保留的尾部长度。比头部长，因为报错和退出码都压在末尾
+TAIL_CHARS = 1500
+# 完整输出的落地位置，相对沙箱根目录解析。
+#
+# 为什么放在沙箱里而不是 logs/：它是**给模型读的**（提示语里让模型用 read_file
+# 来读它），放在沙箱外模型就够不着了。代价是这一层内部状态对模型可见、也可写 ——
+# 这是有意的取舍：拿得到完整报错，比藏得严实更值钱。文件名固定、每次覆盖，
+# 因为它的语义是「上一条命令的完整输出」，不是归档，攒一堆反而没人翻。
+CMD_LOG_RELPATH = Path(".jca") / "logs" / "cmd_last.log"
 
 
 def check_single_command(command: str) -> str | None:
@@ -125,13 +148,101 @@ def check_path_escape(command: str, root: Path) -> str | None:
     return None
 
 
+# —— 超长输出的处理 ————————————————————————————————————————————
+def _output_log_path() -> Path:
+    """完整输出该写到哪儿：沙箱根目录下的 .jca/logs/cmd_last.log。
+
+    过一遍 safe_path 是有意的：沙箱根就是它自己的根，这个路径不可能越界，
+    但走同一个入口意味着「写文件前先解析并校验路径」这条规矩没有例外 ——
+    以后有人把常量改成 '../xx' 也拦得住，而不是等出事再想起来。
+    """
+    return safe_path(str(CMD_LOG_RELPATH))
+
+
+def _persist_full_output(full_output: str) -> Path | None:
+    """把完整输出落到文件，返回落地的绝对路径；失败返回 None。
+
+    失败**不能**影响命令结果的返回：日志是辅助设施，它坏了不该让工具调用失败。
+    所以这里吞掉异常、只记一条 warning，由调用方决定提示语怎么写。
+
+    路径解析也放在 try 里：万一 CMD_LOG_RELPATH 被改成越界的东西，
+    safe_path 会抛 ValueError —— 那是配置错误，但不该让一次命令调用崩掉。
+    """
+    try:
+        path = _output_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # newline=""：命令输出里是什么换行就写什么，不做翻译
+        path.write_text(full_output, encoding="utf-8", newline="")
+        return path
+    except Exception:
+        logger.warning("完整命令输出写入失败，只返回截断后的内容", path=str(CMD_LOG_RELPATH))
+        return None
+
+
+def _elide_notice(truncated_count: int, saved_path: Path | None) -> str:
+    """头尾之间那段提示语。
+
+    措辞按「完整输出到底存下来了没有」分两种：写失败时还说「已保存到 …」
+    等于教模型去 read_file 一个不存在的文件，它会白跑一趟还以为是自己的问题。
+    """
+    if saved_path is None:
+        return (
+            f"\n\n... [中间省略 {truncated_count} 字符] ...\n"
+            "（完整输出保存失败，上面是头尾两段，中间内容这次拿不到了）\n\n"
+        )
+    return (
+        f"\n\n... [中间省略 {truncated_count} 字符] ...\n"
+        f"（完整输出已保存至 {CMD_LOG_RELPATH.as_posix()}"
+        "，如需完整内容可用 read_file 工具读取）\n\n"
+    )
+
+
+def _format_and_persist_output(command: str, raw_output: str) -> str:
+    """把命令输出整理成给模型看的样子，太长就截成「头 + 尾」。
+
+    短输出原样返回。长输出保留头部 HEAD_CHARS 和尾部 TAIL_CHARS，中间省略，
+    并把**未经截断**的完整内容写进 .jca/logs/cmd_last.log。
+
+    为什么是头 + 尾而不是只留前面：报错和退出码都压在末尾。只截前面那 2000 字符，
+    编译/测试失败时模型看到的全是正常输出，真正的 Traceback 一个字都看不到。
+
+    为什么用切片 `[:HEAD_CHARS]` 而不是 splitlines()：这是**字符预算**，不是行预算。
+    行数不能当预算用 —— 一条 5000 字符的日志可能压在一行里，也可能摊成一千行，
+    只按行数砍，短行会浪费额度、长行照样撑爆。
+    """
+    if len(raw_output) <= MAX_OUTPUT_CHARS:
+        return raw_output
+
+    truncated_count = len(raw_output) - HEAD_CHARS - TAIL_CHARS
+    # 写文件放在切之前：存的是完整的 raw_output，不是切完的两段。
+    # 反过来的话，落地的文件也就缺了中间那段，模型 read_file 回来还是残缺的。
+    saved_path = _persist_full_output(raw_output)
+
+    head = raw_output[:HEAD_CHARS]
+    tail = raw_output[-TAIL_CHARS:]
+    result = head + _elide_notice(truncated_count, saved_path) + tail
+    logger.info(
+        "命令输出过长，已截断并保存完整输出",
+        cmd=command,
+        raw_chars=len(raw_output),
+        returned_chars=len(result),
+        truncated=truncated_count,
+        path=str(saved_path) if saved_path else "",
+        saved=saved_path is not None,
+    )
+    return result
+
+
 @tool
 def run_cmd(command: str) -> str:
     """在工作目录中执行一条命令，并返回它的输出。一次只能传一条命令，
     不能使用管道、重定向或者把多条命令连在一起。
 
     命令的工作目录就是沙箱根目录，命令里请只用相对它的路径：
-    绝对路径（/etc/passwd、C:\\Windows\\...）和用 .. 往外跳的路径会被拦下。"""
+    绝对路径（/etc/passwd、C:\\Windows\\...）和用 .. 往外跳的路径会被拦下。
+
+    输出很长时会只给头尾两段（报错在尾部），完整内容在 .jca/logs/cmd_last.log，
+    可以用 read_file 读。"""
     problem = check_single_command(command)
     if problem:
         # 被规则拦下也是一次「工具调用」，同样要留痕：
@@ -185,4 +296,8 @@ def run_cmd(command: str) -> str:
         logger.warning("命令没有正常结束", cmd=command, code=result.returncode)
     else:
         logger.info("命令执行完成", cmd=command, code=result.returncode, chars=len(output))
-    return output or f"命令已执行，退出码 {result.returncode}，没有输出。"
+    if not output:
+        return f"命令已执行，退出码 {result.returncode}，没有输出。"
+    # 最后一步才做长度控制：前面拼出来的是**完整**输出，落地的文件也要是完整的。
+    # 放在 return 之前而不是之后，是因为返回值就是工具结果本身，没有第二个出口。
+    return _format_and_persist_output(command, output)
