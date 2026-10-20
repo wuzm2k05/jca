@@ -46,6 +46,16 @@ def list_dir(path: str = ".") -> str:
 # BaseChatModel 是 pydantic 模型，往它身上挂自定义状态要额外费些手脚。
 _SCRIPT: list[list[AIMessageChunk]] = []
 
+# 每次 `_stream` 收到的消息列表，一条一条按调用顺序记下来。
+# 系统提示词现在走的是「管道现拼、随请求发出去」这条路（不进 state），
+# 从 checkpointer 里已经看不到它了 —— 想断言「模型确实收到了它」，
+# 只能从模型这一侧看。这同时也是「每次调用的请求长什么样」的取证点。
+_SEEN_REQUESTS: list[list] = []
+
+# 每次 bind_tools 收到的工具名。和 _SEEN_REQUESTS 一样是「从模型那侧取证」，
+# 中间件的挂载策略只能从这里观察。
+_BOUND_TOOLS: list[list[str]] = []
+
 
 class FakeChatModel(BaseChatModel):
     """按脚本吐分片的假模型。
@@ -55,8 +65,9 @@ class FakeChatModel(BaseChatModel):
     `_should_stream` 分支）。
 
     `bind_tools` 也得自己实现：基类上是 `raise NotImplementedError`，
-    而 engine 在构造时就会调它。假模型不需要真的知道工具是什么
-    （工具是 ToolNode 执行、由 `updates` 流回结果的），返回自己就够了。
+    而管道在每次调用时都会调它。假模型不需要真的知道工具是什么
+    （工具是 ToolNode 执行、由 `updates` 流回结果的），但要**记下来**
+    ——「这次绑了哪些工具」是中间件挂载策略的唯一观测点。
     """
 
     @property
@@ -64,12 +75,14 @@ class FakeChatModel(BaseChatModel):
         return "fake"
 
     def bind_tools(self, tools, **kwargs):  # noqa: ANN001, ANN201
+        _BOUND_TOOLS.append([getattr(t, "name", str(t)) for t in tools])
         return self
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:  # noqa: ANN001
         raise NotImplementedError("这个假模型只支持流式")
 
     def _stream(self, messages, stop=None, run_manager=None, **kwargs) -> Iterator[ChatGenerationChunk]:  # noqa: ANN001
+        _SEEN_REQUESTS.append(list(messages))
         if not _SCRIPT:
             raise RuntimeError("脚本用完了")
         for chunk in _SCRIPT.pop(0):
@@ -106,20 +119,32 @@ def _agent_round(text_before: str, call: tuple[str, str, str] | None = None) -> 
     return chunks
 
 
-def _build_engine() -> JCAEngine:
+def _build_engine(*, middlewares=None) -> JCAEngine:
     """造一个只用假模型的 engine。
 
-    三个注入点都用了，理由各不相同：
+    四个注入点都用了，理由各不相同：
       - `llm`：不碰 API。
       - `tools`：不碰真实文件系统。用真工具的话，假模型喊一句 list_dir，
         ToolNode 就会去翻运行测试的那台机器 —— 断言就变成了断言环境。
       - `system_prompt`：默认那个会去读本机的工作目录，同上。
+      - `middlewares`：默认是 TodoMiddleware（它会给每次请求追加一大段
+        write_todos 提示词）。这里传空列表，让这些用例只测**引擎**自己：
+        图怎么连、事件怎么翻译。中间件的专属行为在 tests/test_middleware.py，
+        那边是拿它当主角测的。
     """
     return JCAEngine(
         llm=FakeChatModel(),
         tools=[list_dir],
         system_prompt="（测试用系统提示）",
+        middlewares=middlewares if middlewares is not None else [],
     )
+
+
+def _reset() -> None:
+    """三个记录器一起清空。少清一个，上一条用例的残留就会变成假通过/假失败。"""
+    _SCRIPT.clear()
+    _SEEN_REQUESTS.clear()
+    _BOUND_TOOLS.clear()
 
 
 async def _collect(engine: JCAEngine, prompt: str) -> list:
@@ -128,7 +153,7 @@ async def _collect(engine: JCAEngine, prompt: str) -> list:
 
 def test_text_tool_result_text() -> None:
     """一轮完整链路：模型说话 → 调工具 → 工具返回 → 再说话 → 收尾。"""
-    _SCRIPT.clear()
+    _reset()
     _SCRIPT.append(_agent_round("我先看一下目录。", ("list_dir", '{"path": "hello_world"}', "call_1")))
     _SCRIPT.append(_agent_round("已经跑通了。"))
 
@@ -204,8 +229,13 @@ def test_translate_update_extracts_tool_calls() -> None:
 
 
 def test_multi_turn_keeps_history() -> None:
-    """多轮上下文靠 checkpointer 维持 —— UI 层不持有历史，这是它能保持干净的前提。"""
-    _SCRIPT.clear()
+    """多轮上下文靠 checkpointer 维持 —— UI 层不持有历史，这是它能保持干净的前提。
+
+    顺带钉住另一件事：**state 历史里一条 SystemMessage 都没有**。系统提示词
+    已经改由中间件管道每次调用现拼（见 engine/middleware/base.py），不进 state。
+    这比原来「靠固定 id 去重」更彻底：不是攒下一条然后反复替换，而是根本不存。
+    """
+    _reset()
     # 第一轮：一轮纯文本
     _SCRIPT.append(_agent_round("第一轮的回答。"))
     # 第二轮：也是纯文本
@@ -229,15 +259,21 @@ def test_multi_turn_keeps_history() -> None:
     kinds = [type(m).__name__ for m in state.values["messages"]]
     assert kinds.count("HumanMessage") == 2, kinds
     assert kinds.count("AIMessage") == 2, kinds
-    # 系统提示只有一条。每轮都往 inputs 里塞一份，靠的是固定 id ——
-    # `add_messages` 同 id 是替换。id 一丢，三轮下来就是三份重复的系统提示，
-    # 每一份都会被原样发出去，白烧 token 还稀释指令。
-    assert kinds.count("SystemMessage") == 1, kinds
+    assert kinds.count("SystemMessage") == 0, kinds
+
+    # 但模型那边**确实**收到了系统提示词 —— 它只是没从历史里来。
+    # 两次调用各看到一份，而且都在消息列表的第一位（管道拼上去的）。
+    assert len(_SEEN_REQUESTS) == 2, _SEEN_REQUESTS
+    for request in _SEEN_REQUESTS:
+        assert type(request[0]).__name__ == "SystemMessage", request
+        assert request[0].content == "（测试用系统提示）", request[0]
+    # 而且每份请求里只有一条系统提示 —— 现拼的东西不会累积
+    assert [sum(type(m).__name__ == "SystemMessage" for m in r) for r in _SEEN_REQUESTS] == [1, 1]
 
 
 def test_llm_failure_becomes_agent_error() -> None:
     """接口报错要变成 AgentError，不能把栈打到 UI 上。"""
-    _SCRIPT.clear()
+    _reset()
 
     def boom(self, messages, stop=None, run_manager=None, **kwargs):  # noqa: ANN001
         raise ConnectionError("模拟：连不上")
@@ -275,8 +311,13 @@ def test_safety_block_retries_then_gives_up() -> None:
         def _stream(self, messages, stop=None, run_manager=None, **kwargs):  # noqa: ANN001
             raise _BlockedError("sensitive_words_detected")
 
-    _SCRIPT.clear()
-    engine = JCAEngine(llm=BlockedModel(), tools=[list_dir], system_prompt="（测试用系统提示）")
+    _reset()
+    engine = JCAEngine(
+        llm=BlockedModel(),
+        tools=[list_dir],
+        system_prompt="（测试用系统提示）",
+        middlewares=[],
+    )
     events = asyncio.run(_collect(engine, "随便说点什么"))
 
     notices = [e for e in events if isinstance(e, Notice)]

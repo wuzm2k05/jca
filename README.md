@@ -143,7 +143,8 @@ The two marks in the middle are the whole point of the section on deciding vs do
 `●` is a *request*, written by the model; `⎿` is the *result*, produced by your own
 code. They never merge into one line.
 
-**The tools** are the whole of what the agent can do (`tools/files.py`, `tools/shell.py`):
+**The tools** are the whole of what the agent can do (`tools/files.py`, `tools/shell.py`,
+plus one supplied by a middleware — see [below](#pre-llm-middleware)):
 
 | Tool | What it does |
 | --- | --- |
@@ -154,6 +155,7 @@ code. They never merge into one line.
 | `edit_file(path, old_text, new_text)` | one exact-string replacement |
 | `replace_lines(path, start_line, end_line, new_content)` | replaces an inclusive line range, by the numbers `read_file` printed |
 | `run_cmd(command)` | one command, in the workspace root; output over 2000 chars comes back head+tail, with the full text in `.jca/logs/cmd_last.log` |
+| `write_todos(todos)` | replaces the plan — a list of `{content, status}` with `status` one of `pending` / `in_progress` / `completed`. Supplied by `TodoMiddleware`, not by `tools/`; see [the middleware section](#pre-llm-middleware) |
 
 `read_file` and `replace_lines` are deliberately numbered the same way, so the model can
 read lines 200-260, decide what is wrong, and write that range back without ever pasting
@@ -183,6 +185,94 @@ handling, so nothing to go wrong on Windows consoles. Feel free to add them.
 UI itself stores no history. Everything you said earlier in the session is visible to
 the model, including files it wrote (it reads them back with `read_file` rather than
 remembering their contents).
+
+---
+
+### Pre-LLM middleware
+
+`engine/middleware/` is where "how to call the model" lives. It used to be hard-coded in
+`engine/agent.py`'s `_agent_node`: one system prompt fixed at construction, tools bound
+once with `bind_tools`, a `SystemMessage` pushed into the state history every turn. Anything
+you wanted to change about that — mount a tool only when it is needed, inject fresh context,
+compact the history, RAG in a skill — meant editing the node itself.
+
+Now a middleware is an object with three hooks, and the graph grew two nodes to run them:
+
+```
+START → before_model → agent → after_model ─┬─→ tools ─┐
+                                             └─→ END    │
+                                   ↑                    │
+                                   └────────────────────┘
+```
+
+| Hook | Changes | Runs |
+| --- | --- | --- |
+| `before_model(state)` | **the state** — returns an update dict | in the `before_model` node, in declaration order |
+| `after_model(state)` | **the state** — returns an update dict | in the `after_model` node, in *reverse* order |
+| `wrap_model(request, handler)` | **this one call** — prompt, tool set, messages | inside the `agent` node, nested outermost-first |
+
+The two hook nodes sit **inside the ReAct loop** — `tools` returns to `before_model`, not
+to `agent` — so every "model → tool → model" round recomputes its context. That is
+deliberate: a tool result can invalidate something a middleware wanted to say, and the
+context is cheap next to a model request.
+
+Two rules come with the two hook nodes, and both are silent when broken:
+
+- **`after_model` must not append messages.** The next hop is `tools_condition`, which
+  reads the *last* message: adding a `HumanMessage` there tells it the model did not ask
+  for a tool, so the graph ends and the tool the model just requested is never executed.
+  Nothing raises.
+- **The safety retry never reaches `after_model`.** `agent` has no static out-edge; it
+  returns `Command(goto=...)` — `after_model` on success, `before_model` on a retry, since
+  a blocked round has no model reply for a post-model hook to see. This is also why the
+  retry has to be a *Command* rather than a plain return: `Command.goto` **adds** a branch
+  rather than replacing the static edge, so with an `agent → after_model` edge in place the
+  blocked round would run both hooks in the same superstep — which crashes the graph
+  outright the moment any middleware writes the same state key from both.
+
+`wrap_model` is the one that matters most. It receives a `ModelRequest` — a throwaway object
+holding the state, the messages to send, the system prompt and the tool set — and a
+`handler` that means "the rest of the chain, ending in the real call". Calling
+`handler(request)` hands over; returning an `AIMessage` yourself is also legal (that would
+be a middleware deciding *for* the model), but every middleware here only adds to the
+request. The request is built fresh on each call and dropped afterwards, which is why the
+system prompt is **never stored in the state**: a prompt kept in history gets re-sent on
+every subsequent turn, burns tokens, and makes "who changed it, and when" unanswerable.
+The one thing that *is* state — the todo list — is re-read from the state and re-rendered
+on each call, so the model always sees the current version instead of a stale copy.
+
+Tools follow the same split. `tools/` is the **resident** registry (`build_tools()`):
+`list_dir`, `read_file`, `run_cmd` and friends exist in every session. A tool that a
+middleware mounts lives next to that middleware instead, because such a tool and the state
+field it writes are two halves of one contract — `write_todos` writes the `todos` field
+that `TodoMiddleware` declares. The tool set is computed per call
+(`MiddlewarePipeline.tools`), so "always mount" and "mount only in these rounds" are one
+line apart.
+
+`TodoMiddleware` is the first one. It adds `todos` to the state, mounts `write_todos`, and
+appends the current checklist to the system prompt on every call:
+
+```
+● write_todos(todos=[{content: "read engine/agent.py", status: "in_progress"}, ...])
+⎿ 已更新 3 条待办（1 项进行中，2 项待办）
+```
+
+`write_todos` returns a `Command` rather than a string, which is what makes "the tool
+synchronises the state" a single step: the same return value writes `todos` **and** hands
+the model its `ToolMessage` receipt. There is no `after_model` pass that scans what the
+model just called and copies the result into the state — that copy would eventually drift
+from the truth. (The matching `ToolMessage` is not optional: `ToolNode` rejects a command
+without one.) The `todos` field carries a last-write-wins reducer, because a model calling
+`write_todos` twice in one round — which it does, despite the tool description asking it not
+to — would otherwise kill the graph with `InvalidUpdateError: Can receive only one value
+per step`, surfacing to you as a generic "调用模型失败" error.
+
+The state schema follows the same principle. A middleware declares its own fields in
+`state_schema`, and `MiddlewarePipeline.build_state_schema` merges them into the graph's
+state at build time — adding a middleware should not mean editing `engine/agent.py`. The
+merge reads `get_type_hints(..., include_extras=True)`, because the reducers live *inside*
+`Annotated` and the default strips them; a duplicated field name is a startup error rather
+than a silent last-one-wins.
 
 **Symbols and old terminals.** On a console that cannot show `⏺`/`⎿` (a GBK code page
 in `cmd.exe`, for instance) set `JCA_ASCII=1` and they degrade to `>`, `-`, `!`:
@@ -322,11 +412,12 @@ creating it — where commands run is your decision, not a side effect.
 
 ## 5. Tests
 
-`tests/` holds three offline suites. None needs an API key or a terminal, and none
+`tests/` holds four offline suites. None needs an API key or a terminal, and none
 needs pytest — they are plain functions with a `main()`:
 
 ```bash
 uv run python -m tests.test_engine_events    # the agent loop, against a scripted model
+uv run python -m tests.test_middleware       # the middleware pipeline and TodoMiddleware
 uv run python -m tests.test_ui_transcript    # events in, rendered text out
 uv run python -m tests.test_tools            # the file and shell tools, against real temp dirs
 ```
@@ -342,6 +433,21 @@ that a failed call becomes an error event rather than a stack trace on the user'
 The UI suite feeds synthetic events into the same function the live display uses. What it
 checks is that each event lands somewhere sensible — a tool result attaches to its call,
 a multi-line result is folded, an unknown event type is ignored rather than crashing.
+
+The middleware suite is the one that tests things you cannot see from outside. A middleware
+whose order is reversed still runs; a system prompt that accumulates two copies still gets
+an answer; a `write_todos` that returns a string instead of a `Command` still lets the
+conversation continue — the model just never sees its own plan again, and nothing raises.
+So it takes evidence from the model's side: the fake model records every message list it
+is handed and every tool set it is bound to, and the assertions are about those records.
+One case drives the whole graph — the model calls `write_todos`, the tool writes the state,
+and the **next** call's system prompt contains the checklist — which is four separately
+working mechanisms in a row, none of which fails loudly on its own. Three regression cases
+came out of reviewing the design and pin failures that are all silent: a hook node that
+annotates its `state` parameter with the base state and therefore never sees `todos`; a
+retry that runs `after_model` on a round with no model reply; two `write_todos` calls in
+one round. Two more count `before_model` invocations across a safety retry and check the
+merged state schema keeps its reducers.
 
 The tools suite is the one that touches a disk, so it works in a temporary directory it
 creates **inside** the working directory and deletes afterwards — `safe_path` only allows

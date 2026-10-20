@@ -6,6 +6,33 @@
 对外只有三个东西：`JCAEngine`、`stream_turn()`（异步生成器）、两个只读属性。
 UI 那边拿到的全是 engine/events.py 里的 dataclass。
 
+## 这件事现在被拆成了两层
+
+「怎么调模型」不再写在这个文件里，而在 `engine/middleware/`。图的形状是：
+
+    START → before_model → agent → after_model ─┬─→ tools ─┐
+                                                 └─→ END    │
+                                       ↑                    │
+                                       └────────────────────┘
+
+两个钩子节点**都在 ReAct 循环里**（注意 tools 回到的是 before_model，不是
+直接回 agent）。这一点是刻意的：每一轮「模型 → 工具 → 再模型」都要重新跑一遍
+中间件，因为上下文本来就变了 —— 上一轮的工具结果可能让某段 system prompt
+不再适用。代价是每轮多两次函数调用，相对一次模型请求可以忽略。
+
+这个文件负责的是**图的形状**：节点怎么连、异常怎么翻译成事件、重试往哪儿跳。
+中间件负责的是**每次调用长什么样**。
+
+## 系统提示词为什么不在 state 里了
+
+以前每一轮往 inputs 里塞一条固定 id 的 SystemMessage，靠 `add_messages` 同 id
+替换来保证历史里只有一条。现在不塞了 —— 系统提示词由管道在**每次调用**时现造
+（`MiddlewarePipeline._invoke` 里拼到消息列表最前面），进不了 checkpointer，
+也就不存在「攒了三条一样的系统提示、每一份都被原样发给模型」这个问题。
+好处不只是省 token：中间件可以往里面加只在**这次**成立的内容（比如当前清单），
+而这种内容本来就不该被永久留在对话历史里。改这里的 inputs 之前请先读
+`engine/middleware/base.py` 的模块说明。
+
 ## 为什么用 stream_mode=["messages", "updates"] 而不是 astream_events
 
 两种都试过，这里是实测结论（langgraph 1.2.15）：
@@ -37,11 +64,11 @@ UI 那边拿到的全是 engine/events.py 里的 dataclass。
 """
 
 import os
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Sequence
 
 from langchain_core.exceptions import ModelInvalidRequestError
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import START, MessagesState, StateGraph
@@ -67,6 +94,7 @@ from .events import (
     ToolResult,
     TurnDone,
 )
+from .middleware import BaseMiddleware, MiddlewarePipeline, TodoMiddleware
 
 logger = get_logger(__name__)
 
@@ -79,11 +107,19 @@ MAX_TOOL_OUTPUT = 2000
 # 调用方（main.py）仍然可以覆盖。
 DEFAULT_MODEL = "DeepSeek-V4.1-Flash"
 
+# 默认挂上的中间件。想加就写一个 BaseMiddleware 子类塞进来 ——
+# 图的结构不用改，见 engine/middleware/base.py 的模块说明。
+DEFAULT_MIDDLEWARES: tuple[type[BaseMiddleware], ...] = (TodoMiddleware,)
+
 
 class AgentState(MessagesState):
     """MessagesState 只声明了 messages，这里再加一个计数字段。
 
     没给它配 reducer，所以是「后写覆盖先写」，每次进节点读到的都是最新值。
+
+    中间件要加的字段**不写在这里**，而是各自用 `state_schema` 声明、
+    由 `MiddlewarePipeline.build_state_schema` 在建图时合并进来 ——
+    加一个中间件不该来动这个文件。
     """
 
     safety_retries: int
@@ -96,9 +132,9 @@ class JCAEngine:
     多轮上下文交给 checkpointer 维护 —— 这是 UI 层能保持干净的关键：
     **它不需要持有任何 message 列表**，自然也漏不出 LangChain 的类型。
 
-    构造参数里的 `llm` 和 `tools` 是给测试用的注入点：传一个假的
-    BaseChatModel + 一个不碰真实文件系统的工具，就能离线跑通整条链路
-    （见 tests/test_engine_events.py），不用 API key。
+    构造参数里的 `llm` / `tools` / `system_prompt` / `middlewares` 都是给测试用的
+    注入点：传一个假的 BaseChatModel + 一个不碰真实文件系统的工具，就能离线跑通
+    整条链路（见 tests/test_engine_events.py），不用 API key。
     """
 
     def __init__(
@@ -108,10 +144,10 @@ class JCAEngine:
         llm: BaseChatModel | None = None,
         tools: list | None = None,
         system_prompt: str | None = None,
+        middlewares: Sequence[BaseMiddleware] | None = None,
         thread_id: str = "jca-cli",
     ) -> None:
         self._model_name = model
-        self._system_prompt = system_prompt or build_system_prompt()
         self._thread_id = thread_id
         self._turns = 0
 
@@ -130,14 +166,64 @@ class JCAEngine:
                 base_url=os.getenv("DEEPSEEK_API_BASE_URL", "https://api.deepseek.ai"),
                 temperature=0,
             )
-        self._llm = llm.bind_tools(tool_list)
 
-        workflow = StateGraph(AgentState)
-        workflow.add_node("agent", self._agent_node)
-        workflow.add_node("tools", ToolNode(tool_list))
-        workflow.add_edge(START, "agent")
-        workflow.add_conditional_edges("agent", tools_condition)
-        workflow.add_edge("tools", "agent")
+        # 传 None 用默认那组，传 [] 就是「一个中间件都不要」—— 测试要用这个区分
+        # 两种意图，所以不能写成 `middlewares or DEFAULT`（那会把 [] 也当成没传）。
+        mw_list = (
+            [cls() for cls in DEFAULT_MIDDLEWARES] if middlewares is None else list(middlewares)
+        )
+
+        # 模型不再在这里 bind_tools：工具集是**每次调用**算出来的
+        # （见 MiddlewarePipeline.call_model），因为中间件可能要按当前状态加减工具。
+        self._pipeline = MiddlewarePipeline(
+            llm,
+            mw_list,
+            system_prompt=system_prompt or build_system_prompt(),
+            tools=tool_list,
+        )
+
+        # 图的 state 类型 = 基础 state + 各中间件声明的字段。
+        state_schema = MiddlewarePipeline.build_state_schema(AgentState, mw_list)
+
+        workflow = StateGraph(state_schema)
+        # 三个节点都必须显式写 input_schema=state_schema，这不是啰嗦。
+        #
+        # 不写的话，LangGraph 会拿节点函数**第一个参数的类型标注**当这个节点的
+        # 输入 schema（state.py 里 add_node 的 inferred_input_schema 那段，靠
+        # get_type_hints 读标注），然后就照着它裁剪传给节点的 state。
+        # 问题在于「基础 state + 各中间件加的字段」是**运行时**拼出来的，没有
+        # 任何静态标注能描述它 —— 只能写成 `state: AgentState`，而 AgentState
+        # 里没有 todos。于是中间件加的字段会在进节点前被悄悄滤掉：
+        # 图照跑、工具照写、checkpointer 里也存得住，只有节点里读不到。
+        # 这个错误的全部症状就是「中间件看不见自己的状态」，一句报错都没有。
+        workflow.add_node("before_model", self._before_model_node, input_schema=state_schema)
+        workflow.add_node("agent", self._agent_node, input_schema=state_schema)
+        workflow.add_node("after_model", self._after_model_node, input_schema=state_schema)
+        workflow.add_node("tools", ToolNode(self._pipeline.tools))
+        workflow.add_edge(START, "before_model")
+        workflow.add_edge("before_model", "agent")
+        # agent 没有静态出边，下一步完全由它返回的 Command(goto=...) 决定。两个去向：
+        #   - 正常答复 → after_model →(tools_condition)→ tools / END
+        #   - 被内容判定拦下 → before_model（**绕过 after_model**）
+        #
+        # 为什么这里不能写 `add_edge("agent", "after_model")`：`Command.goto` 不是
+        # 「改走另一条边」，而是**在静态边之外再加一条分支**。实测（langgraph 1.2.15）
+        # 打印每个超步拿到的节点名，重试那一轮是：
+        #
+        #     before_model / agent / before_model + after_model（同一个超步）
+        #
+        # 两个后果。一是被拦下的那一轮**根本没有成功的模型答复**，却跑了一遍
+        # after_model，语义上就是错的；二是两个钩子节点落进同一个超步，只要有任何
+        # 中间件在两个钩子里写同一个 state 键，LangGraph 就直接抛
+        # 「InvalidUpdateError: At key '...': Can receive only one value per step」
+        # —— 而「压缩历史」那类中间件恰好有理由两边都写。把静态边去掉，这个可能性
+        # 在结构上就不存在了。
+        #
+        # 条件边仍然挂在 after_model 上（而不是 agent 上）：这样模型的每一次答复
+        # 都会先过一遍 after_model，才决定要不要调工具。
+        workflow.add_conditional_edges("after_model", tools_condition)
+        # 工具跑完回到 before_model 而不是 agent —— 这就是「两个钩子都在循环里」。
+        workflow.add_edge("tools", "before_model")
 
         # checkpointer 让同一个 thread_id 的多轮对话自动接上历史。
         # 存在内存里就够：这个进程活多久，会话就活多久。
@@ -155,11 +241,27 @@ class JCAEngine:
         return self._turns
 
     # —— 图节点 ————————————————————————————————————————————————
+    def _before_model_node(self, state: AgentState):
+        """进 agent 之前：把所有中间件的 before_model 跑一遍。
+
+        返回 None 表示不改任何状态 —— LangGraph 认这个，比返回空 dict 更明确。
+        """
+        return self._pipeline.before_model(state)
+
+    def _after_model_node(self, state: AgentState):
+        """模型答复之后、决定要不要调工具之前：跑一遍中间件的 after_model（逆序）。"""
+        return self._pipeline.after_model(state)
+
     def _agent_node(self, state: AgentState):
+        """一次模型调用。
+
+        真正干活的是管道：它建一份本次调用的请求（system prompt、工具集都由中间件
+        现算），穿过所有 wrap_model，把答复拿回来。这里只管**出错怎么办**。
+        """
         retries = state.get("safety_retries", 0)
 
         try:
-            response = self._llm.invoke(state["messages"])
+            response = self._pipeline.call_model(state)
         except ModelInvalidRequestError as e:
             # 服务端对**整个请求体**做内容判定，命中就返回 400。
             # 不是内容问题就照原样抛出去（认证失败、限流那些本来也不是这个异常，
@@ -174,20 +276,29 @@ class JCAEngine:
 
             # 把这次「拒绝」包成一条 HumanMessage 放回对话，再回到自己重来一次。
             #
-            # 为什么用 Command 而不是普通 return：普通 return 之后由 tools_condition
-            # 决定下一步，而它会看到最后一条是没有工具申请的 HumanMessage —— 图会直接
-            # 结束，回不到 agent。Command(goto=...) 是节点自己指定下一步，能绕开条件边。
+            # 为什么用 Command 而不是普通 return：普通 return 之后由配置的边决定
+            # 下一步，而 agent 的出边由 `Command(goto="after_model")` 给出，接着
+            # `tools_condition` 会看到最后一条是没有工具申请的 HumanMessage ——
+            # 图会直接结束，回不到 agent。Command(goto=...) 是节点自己指定下一步。
+            #
+            # 去的是 before_model 而不是 after_model/agent：重试是一次新的模型调用，
+            # 也该重新走一遍中间件（提示词现造、工具集现算）；而 after_model 是
+            # 「模型答完之后」的钩子，这一轮根本没有成功的答复，不该跑。
             logger.warning("被内容判定拦下，准备重试", attempt=retries + 1, limit=MAX_SAFETY_RETRIES)
             return Command(
-                goto="agent",
+                goto="before_model",
                 update={
                     "messages": [build_retry_message()],
                     "safety_retries": retries + 1,
                 },
             )
 
-        # 这一轮成功了就清零：重试额度按「连续被拦」算，不是按累计次数算
-        return {"messages": [response], "safety_retries": 0}
+        # 成功了：唯一一条走 after_model 的路径。这一轮算成功，重试额度清零
+        # （额度按「连续被拦」算，不是按累计次数算）。
+        return Command(
+            goto="after_model",
+            update={"messages": [response], "safety_retries": 0},
+        )
 
     @staticmethod
     def _is_safety_block(error: BaseException) -> bool:
@@ -210,13 +321,10 @@ class JCAEngine:
         """
         inputs = {
             "messages": [
-                # 固定 id 是有意的：`add_messages` 对同 id 的消息是**替换**而不是
-                # 追加，所以每一轮重新塞一遍系统提示，历史里也只会有一条。
-                # 不给 id 的话（默认每个对象一个随机 uuid），跑三轮历史里就有
-                # 三条一模一样的系统提示，每一条都会被原样发给模型。
-                #
-                # 实测确认过这一点（见 tests/test_engine_events.py 的多轮用例）。
-                SystemMessage(content=self._system_prompt, id="system-prompt"),
+                # 这里**只**放用户这一轮说的话。系统提示词不进 state ——
+                # 它由中间件管道在每次模型调用时现拼（见模块说明和
+                # engine/middleware/base.py），所以历史里不会再攒下重复的提示词，
+                # 也不会把「只对这一次成立」的内容永久留在对话里。
                 ("user", prompt),
             ]
         }
@@ -302,6 +410,11 @@ class JCAEngine:
 
         这里同样要按类型过滤，原因见模块开头：重试用的那条 HumanMessage
         节点名也叫 agent，会混进来。
+
+        注意**任何**节点返回的 AIMessage 都会被当成「模型申请调工具」翻译出去。
+        现在只有 agent 节点会吐 AIMessage，所以没问题；但中间件从 `before_model`
+        往 messages 里塞消息是设计上允许的（比如压缩历史），那种情况下别塞
+        AIMessage —— 用户会在终端上看到一个自己没申请过的「工具调用」。
         """
         events: list[AgentEvent] = []
         for _node, update in payload.items():
@@ -340,4 +453,10 @@ def _truncate(text: str, limit: int) -> str:
     return text[:limit]
 
 
-__all__ = ["JCAEngine", "AgentState", "MAX_TOOL_OUTPUT", "DEFAULT_MODEL"]
+__all__ = [
+    "DEFAULT_MIDDLEWARES",
+    "DEFAULT_MODEL",
+    "MAX_TOOL_OUTPUT",
+    "AgentState",
+    "JCAEngine",
+]
