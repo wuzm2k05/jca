@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# 虚拟环境
+.venv/
+
+# agent 的沙箱作业区
+workspace/
+
+# 运行期产生的日志（含轮转出来的历史文件）
+logs/
+
+# 本地凭据，不要提交
+.env
+
+# 本地启动脚本，内含同一把 key
+start_claude_autodl.bat
+
+# PyInstaller 产物
+build/
+dist/
