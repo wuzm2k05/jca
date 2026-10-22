@@ -7,18 +7,23 @@
 
 为什么值得单独测：这一层最容易错的地方**从外面看不见**。
 
-- system prompt 是不是每次现拼的？拼错了模型照常回答，只是答得不好 —— 没有
-  任何报错，只有「感觉它最近不太听话」。所以要正面断言「这次请求里有什么」。
+- system prompt 是不是每次现拼的、而且**每次逐字相同**？这两个问题各有各的
+  静默失败：前者拼错的话模型照常回答，只是答得不好（「感觉它最近不太听话」）；
+  后者抖动的话一切看起来正常，只有服务端的前缀 KV Cache 命中不了，而代价是
+  账单和首字延迟 —— 本地跑测试永远看不出来。所以要正面断言「这次请求里有什么」。
 - 中间件的顺序？洋葱模型包反了照样跑得通，只是 `after_model` 的收尾顺序和
   `before_model` 对不上，那是一种要等到某个中间件依赖另一个的结果时才发作的病。
 - `write_todos` 有没有真的把状态写进去？工具返回一段文字也能让对话继续，
   区别只在下一轮模型看不看得见清单。
+- 想拦下一轮时，返回**状态增量**和返回 `Command` 的区别？前者只改 state、
+  改不了去向，工具照跑不误 —— 而它同时又是最自然的写法，所以特别值得钉。
 
 这些都要靠「从模型那一侧取证」来钉：假模型把每次收到的消息、每次绑到的工具
 记下来，断言的对象是那些记录，而不是跑完之后的状态快照。
 
-第六个用例（重试路径）还顺手钉住了 `Command(goto="before_model")` 这个选择 ——
-它和 `goto="agent"` 只差一个词，但后者会让中间件在重试时被跳过。
+两个用例（重试路径、并行 write_todos 的拦截）还顺手钉住了 `Command(goto=...)`
+的两个选择 —— `goto="before_model"` 和 `goto="agent"` 只差一个词，但后者会让
+中间件在下一次模型调用前被跳过。
 """
 
 import asyncio
@@ -39,7 +44,7 @@ from engine.middleware import (
     TodoMiddleware,
     write_todos,
 )
-from prompts import render_todos
+from prompts import WRITE_TODOS_SYSTEM_PROMPT
 
 # —— 取证用的记录器 ————————————————————————————————————————————
 #
@@ -352,27 +357,94 @@ def test_state_schema_rejects_duplicate_fields() -> None:
         raise AssertionError("重复声明 todos 居然通过了")
 
 
-# —— 清单的渲染 ————————————————————————————————————————————————
-def test_render_todos_marks_each_state() -> None:
-    """三种状态各有一个一眼能认出的记号；认不出的状态不要丢条目。"""
-    assert render_todos(None) == ""
-    assert render_todos([]) == ""
+# —— system prompt 的静态性（保护前缀 KV Cache）———————————————
+def _static_prompt_tail() -> str:
+    """`TodoMiddleware` 稳定追加的那一段。"""
+    return "\n\n" + WRITE_TODOS_SYSTEM_PROMPT
 
-    out = render_todos(
-        [
-            {"content": "读代码", "status": "completed"},
-            {"content": "写管道", "status": "in_progress"},
-            {"content": "写测试", "status": "pending"},
-        ]
+
+def test_todo_middleware_prompt_stability() -> None:
+    """多轮对话里，system prompt 必须**逐字**不变 —— 这是 KV Cache 的前提。
+
+    清单早先是现读 state 渲染后拼在 prompt 末尾的，那让 prompt 尾部每轮都抖：
+    服务端的前缀缓存要求「从头开始的最长公共前缀」，尾巴一变，后面所有历史消息
+    都跟着失效，TTFT 和 token 成本一起上去。这条测试就是把「不再抖」钉住。
+
+    分两段取证。**第一段**直接驱管道，控制 state 里 `todos` 的内容（空 → 一张 →
+    换一张），断言三次拼出来的 prompt 一模一样。**第二段**走完整图跑两轮真实
+    对话，模型在这两轮里写出不同的清单，然后把模型**每一次**调用看到的那条
+    SystemMessage 全收上来比对 —— 只测 `wrap_model` 是不够的，prompt 还可能
+    被别的机制（历史里的 SystemMessage、中间件在别处改 request）污染。
+    """
+    # —— 第一段：直接驱管道，只换 state 里的清单 ——
+    llm = _StubLLM()
+    pipeline = MiddlewarePipeline(
+        llm,  # type: ignore[arg-type]
+        [TodoMiddleware()],
+        system_prompt="基础提示",
     )
-    assert "[x] 读代码" in out, out
-    assert "[~] 写管道" in out, out
-    assert "[ ] 写测试" in out, out
+    empty = {"messages": [HumanMessage(content="你好")], "todos": []}
+    one = {
+        "messages": [HumanMessage(content="你好")],
+        "todos": [{"content": "读 engine", "status": "in_progress"}],
+    }
+    changed = {
+        "messages": [HumanMessage(content="你好")],
+        "todos": [
+            {"content": "读 engine", "status": "completed"},
+            {"content": "写中间件", "status": "pending"},
+        ],
+    }
+    for state in (empty, one, changed):
+        pipeline.call_model(state)
 
-    # 认不出的状态原样显示，不能把这一条吃掉 —— 吃掉的话模型会以为自己写的
-    # 清单没生效，于是反复重写
-    odd = render_todos([{"content": "怪状态", "status": "blocked"}])
-    assert "怪状态" in odd and "blocked" in odd, odd
+    prompts = [m[0].content for m in llm.sent]
+    assert len(prompts) == 3, prompts
+    assert prompts[0] == prompts[1] == prompts[2], prompts
+    assert prompts[0] == "基础提示" + _static_prompt_tail(), prompts[0]
+    # 清单本身一个字都不该进 prompt（三份 state 各不相同，文本却完全相同，
+    # 上面那条已经保证了；这里再正面钉一句，免得以后有人把标记悄悄加回来）
+    assert "Current todo list" not in prompts[0], prompts[0]
+    assert "读 engine" not in prompts[0], prompts[0]
+
+    # —— 第二段：走完整图，两轮对话 + 清单变更 ——
+    _reset()
+    first_todos = [
+        {"content": "读一遍 engine", "status": "in_progress"},
+        {"content": "写中间件", "status": "pending"},
+    ]
+    second_todos = [
+        {"content": "读一遍 engine", "status": "completed"},
+        {"content": "写中间件", "status": "completed"},
+        {"content": "补测试", "status": "in_progress"},
+    ]
+    # 第一轮：写清单 → 收尾答复
+    _SCRIPT.append(_tool_round("write_todos", {"todos": first_todos}, "c1", "先记一下。"))
+    _SCRIPT.append(_text_round("第一轮结束。"))
+    # 第二轮：把清单整份换掉 → 收尾答复
+    _SCRIPT.append(_tool_round("write_todos", {"todos": second_todos}, "c2", "更新一下。"))
+    _SCRIPT.append(_text_round("第二轮结束。"))
+
+    engine = _build_engine()
+    asyncio.run(_collect(engine, "第一轮"))
+    asyncio.run(_collect(engine, "第二轮"))
+
+    seen = _system_prompts()
+    assert len(seen) == 4, seen  # 两轮各两次模型调用
+    assert len(set(seen)) == 1, [s[-80:] for s in seen]
+    assert seen[0] == "（测试用系统提示）" + _static_prompt_tail(), seen[0]
+
+    # 清单没进 prompt，但**确实进了 state**（它现在的消费方是 UI 与快照）
+    state = engine._graph.get_state({"configurable": {"thread_id": "jca-cli"}})
+    assert [t["content"] for t in state.values["todos"]] == [
+        "读一遍 engine",
+        "写中间件",
+        "补测试",
+    ]
+    # 而且历史里有模型自己写的那次调用 + 回执 —— 清单是靠这个传给模型的
+    kinds = [type(m).__name__ for m in state.values["messages"]]
+    assert "ToolMessage" in kinds, kinds
+    assert "SystemMessage" not in kinds, kinds
 
 
 # —— 走完整图 ————————————————————————————————————————————————
@@ -387,12 +459,17 @@ def _build_engine(**kwargs) -> JCAEngine:
     return JCAEngine(llm=FakeChatModel(), tools=[], **kwargs)
 
 
-def test_write_todos_updates_state_and_shows_up_next_call() -> None:
-    """一条完整的闭环：模型写清单 → 工具把 state 改了 → 下一次调用看得见。
+def test_write_todos_updates_state_through_history_not_prompt() -> None:
+    """一条完整的闭环：模型写清单 → 工具把 state 改了 → 它经**历史**回到模型。
 
     这条链路上有四段各自成立的机制（工具返回 Command、ToolNode 把 update 合并
-    进 state、管道每次现读 state、render_todos 渲染它），任何一段断掉都不会
-    报错 —— 只会让「模型好像忘了自己的计划」。所以这里一次断言到底。
+    进 state、工具回执进 messages、UI 按 tool_call_id 配上回执），任何一段断掉
+    都不会报错 —— 只会让「模型好像忘了自己的计划」。所以这里一次断言到底。
+
+    「回到模型」走的是历史而不是 prompt，这一点是**刻意**的（见
+    `test_todo_middleware_prompt_stability`）：prompt 必须逐字不变才能保住
+    前缀 KV Cache，而清单在历史里本来就有 —— 模型自己那次 `write_todos` 调用
+    加上我们刚还给它的回执。
     """
     _reset()
     todos = [
@@ -407,24 +484,30 @@ def test_write_todos_updates_state_and_shows_up_next_call() -> None:
 
     # 1) 两次模型调用，每次都被绑上了 write_todos
     assert _BOUND_TOOLS == [["write_todos"], ["write_todos"]], _BOUND_TOOLS
-    # 2) 第一次调用的 system prompt 里有工具说明，但**还没有清单**
-    #    （清单是空的时候不加那一段，不然模型会以为已经有一份空计划了）
+    # 2) 两次调用的 system prompt 里都有静态的工具说明，且**两次完全相同** ——
+    #    清单不在里面，所以它不会因为 state 变了而抖
     first, second = _system_prompts()
     assert "write_todos" in first, first[:200]
-    assert "Current todo list" not in first, first
-    # 3) 第二次调用就看得见清单了 —— 这就是「工具自动同步」的效果
-    assert "[~] 读一遍 engine" in second, second
-    assert "[ ] 写中间件" in second, second
+    assert first == second, [first[-80:], second[-80:]]
+    assert "Current todo list" not in second, second
 
-    # 4) 工具结果照常走领域事件回到 UI（这里没有为 todo 加新事件类型）
+    # 3) 工具结果照常走领域事件回到 UI（这里没有为 todo 加新事件类型）
     results = [e for e in events if type(e).__name__ == "ToolResult"]
     assert len(results) == 1, results
     assert results[0].name == "write_todos", results[0]
     assert "2 条待办" in results[0].output, results[0].output
 
-    # 5) 状态里真的存下来了（不是只发给了模型看）
+    # 4) 状态里真的存下来了（现在的消费方是 UI 与持久化快照）
     state = engine._graph.get_state({"configurable": {"thread_id": "jca-cli"}})
     assert [t["content"] for t in state.values["todos"]] == ["读一遍 engine", "写中间件"]
+
+    # 5) 清单经历史回到模型：第二次调用时那条 AIMessage 带着 tool_calls，
+    #    紧随其后的 ToolMessage 是它的回执 —— 模型读这两条就知道计划是什么
+    second_call_messages = _SEEN_REQUESTS[1]
+    calls = [c for m in second_call_messages if isinstance(m, AIMessage) for c in m.tool_calls]
+    assert [c["name"] for c in calls] == ["write_todos"], calls
+    assert [c["args"]["todos"] for c in calls] == [todos], calls
+
     # 6) 系统提示词依旧一条都没进 state 历史
     kinds = [type(m).__name__ for m in state.values["messages"]]
     assert "SystemMessage" not in kinds, kinds
@@ -558,18 +641,25 @@ def test_after_model_does_not_run_on_the_retry_path() -> None:
     assert log.count("after:t") == 1, log
 
 
-def test_parallel_write_todos_does_not_break_the_graph() -> None:
-    """模型一轮里并行调两次 `write_todos` 不能把图搞崩。
+def test_parallel_write_todos_is_rejected_and_the_model_rewrites() -> None:
+    """一轮里并行调两次 `write_todos`：整轮被拒，模型重写，然后才落地。
 
     工具描述里写着 "should never be called multiple times in parallel"，但模型
-    并不总听。ToolNode 会把两条 `Command` 的 update 合成一个列表交给图，而没配
-    reducer 的通道对「同一超步出现两个值」是直接报错的：
+    并不总听。两条调用送来的是两份**互相冲突**的完整清单，谁也不该赢 —— 让后
+    一张覆盖前一张是凭空替模型做了决定。所以由 `TodoMiddleware.after_model`
+    把整轮拒掉：两条调用各配一条错误 ToolMessage，回到 `before_model` 让模型
+    看到错误后重写一次。
 
-        InvalidUpdateError: At key 'todos': Can receive only one value per step.
+    ## 这条测试钉住的是一段**做不到**的写法
 
-    更糟的是这个错会被 stream_turn 的兜底 except 翻成一条语焉不详的
-    `AgentError(kind="api")`（「调用模型失败：At key 'todos'...」），用户完全看不出
-    是自己那轮计划写重了。`TodoState.todos` 上的 `_last_write_wins` 就是为它配的。
+    直觉上「往 messages 里塞一条错误 ToolMessage」就够了，但那只是改 state，
+    **改不了下一步去哪儿** —— `tools_condition` 仍会把这一轮送进 ToolNode，
+    两个真工具照跑（实测：`state["todos"]` 落在 `[]`，因为两条并行 update 互相
+    覆盖；那条错误消息没有配对的 tool_call，被 UI 丢弃，用户什么都看不见；
+    模型一次都没被再调用）。
+
+    所以这里正面断言三件事：错误回执**两条都在**、`todos` **一个字都没写**、
+    模型**被再调用了一次**并成功落地第二次的清单。
     """
     _reset()
     _SCRIPT.append(_parallel_tool_round(
@@ -579,17 +669,103 @@ def test_parallel_write_todos_does_not_break_the_graph() -> None:
         ["p1", "p2"],
         "两条都记一下。",
     ))
+    # 被拒之后模型重写：这次只调一次
+    _SCRIPT.append(_tool_round(
+        "write_todos",
+        {"todos": [{"content": "合并后的一张", "status": "in_progress"}]},
+        "p3",
+        "我合成一份。",
+    ))
     _SCRIPT.append(_text_round("记好了。"))
     engine = _build_engine()
     events = asyncio.run(_collect(engine, "帮我重构"))
 
     kinds = [type(e).__name__ for e in events]
     assert "AgentError" not in kinds, [getattr(e, "message", "") for e in events]
-    assert kinds.count("ToolResult") == 2, kinds
-    # 后一张赢（整份覆盖的语义下，这就是正确结果）
+
+    # 三条 ToolMessage：前两条是拒绝回执，第三条是真正落地的那次
+    results = [e for e in events if type(e).__name__ == "ToolResult"]
+    assert [r.id for r in results] == ["p1", "p2", "p3"], results
+    assert [r.name for r in results] == ["write_todos", "write_todos", "write_todos"], results
+    assert all("只能调用一次" in r.output for r in results[:2]), [r.output for r in results]
+    assert "1 条待办" in results[2].output, results[2].output
+
+    # 被拒的那一轮一个字都没写进 state；重写的那次才落地
     state = engine._graph.get_state({"configurable": {"thread_id": "jca-cli"}})
-    assert [t["content"] for t in state.values["todos"]] == ["第二张"]
-    assert "第二张" in _system_prompts()[1], _system_prompts()[1]
+    assert [t["content"] for t in state.values["todos"]] == ["合并后的一张"]
+
+    # 模型确实被再调用了一次：三次调用（原本的 + 重写 + 收尾），且没有并行残留
+    assert len(_BOUND_TOOLS) == 3, _BOUND_TOOLS
+    # transcript 合法：每个 tool_call 都有配对回执，没有悬空的
+    dangling: list[str] = []
+    for msg in state.values["messages"]:
+        if isinstance(msg, AIMessage):
+            dangling.extend(c["id"] for c in msg.tool_calls)
+        elif type(msg).__name__ == "ToolMessage" and msg.tool_call_id in dangling:
+            dangling.remove(msg.tool_call_id)
+    assert not dangling, dangling
+    # 最后一次调用看到的 prompt 仍是那一份静态文本
+    assert len(set(_system_prompts())) == 1, _system_prompts()
+
+
+def test_rejected_round_gives_every_call_a_receipt() -> None:
+    """整轮被拒时，这一轮里**别的**工具调用也必须有回执，不能只有 write_todos。
+
+    改道意味着 ToolNode 整个不跑，所以这一轮里任何一个工具调用都不会有结果。
+    只给 `write_todos` 补回执是很自然的写法，也照样能跑 —— 但那样别的调用就
+    悬空了，而「带 tool_calls 的 AIMessage 后面必须跟齐对应的 ToolMessage」是
+    服务端的硬要求，下一次请求会被直接拒掉。
+
+    实测过一个 `write_todos` ×2 + `read_file` ×1 的回合：只补 write_todos 时
+    `read_file` 那个 id 一直悬着，transcript 是**非法**的。所以这里断言每个
+    调用都有回执、而且回执带上了工具名（ToolNode 会替真工具填名字，我们手写
+    的消息得自己填，否则 UI 那条工具结果没有名字可显示）。
+    """
+    _reset()
+    _SCRIPT.append([
+        _text("记两条，再读个文件。"),
+        AIMessageChunk(
+            content="",
+            tool_call_chunks=[
+                {
+                    "name": name,
+                    "args": json.dumps(args, ensure_ascii=False),
+                    "id": call_id,
+                    "index": i,
+                }
+                for i, (name, args, call_id) in enumerate(
+                    [
+                        ("write_todos", {"todos": [{"content": "A", "status": "pending"}]}, "p1"),
+                        ("write_todos", {"todos": [{"content": "B", "status": "pending"}]}, "p2"),
+                        ("read_file", {"path": "x.txt"}, "r1"),
+                    ]
+                )
+            ],
+        ),
+        AIMessageChunk(content="", chunk_position="last"),
+    ])
+    _SCRIPT.append(_text_round("记好了。"))
+    engine = _build_engine()
+    events = asyncio.run(_collect(engine, "帮我重构"))
+
+    kinds = [type(e).__name__ for e in events]
+    assert "AgentError" not in kinds, [getattr(e, "message", "") for e in events]
+
+    results = [e for e in events if type(e).__name__ == "ToolResult"]
+    assert [r.id for r in results] == ["p1", "p2", "r1"], results
+    # 名字要带上 —— 悬空/匿名的回执在界面上显示不出来
+    assert [r.name for r in results] == ["write_todos", "write_todos", "read_file"], results
+
+    state = engine._graph.get_state({"configurable": {"thread_id": "jca-cli"}})
+    dangling: list[str] = []
+    for msg in state.values["messages"]:
+        if isinstance(msg, AIMessage):
+            dangling.extend(c["id"] for c in msg.tool_calls)
+        elif type(msg).__name__ == "ToolMessage" and msg.tool_call_id in dangling:
+            dangling.remove(msg.tool_call_id)
+    assert not dangling, dangling
+    # 整轮作废：一个清单都没写进去
+    assert state.values["todos"] == [], state.values["todos"]
 
 
 def test_todos_reducer_starts_empty_not_absent() -> None:
@@ -597,9 +773,13 @@ def test_todos_reducer_starts_empty_not_absent() -> None:
 
     这一条是 `_last_write_wins` 的副作用，容易被下一个中间件踩到：
     `state.get("todos")` 第一次拿到的是 `[]` 而不是 `None`。凡是判「有没有清单」
-    的地方都得按真假值判 —— `render_todos` 两种都吃，但别的代码未必。
-    钉住它，免得以后有人看到 `[]` 以为是 bug 又把 reducer 去掉（那样并行调用
-    就又崩了）。
+    的地方都得按真假值判 —— 别的代码未必像 `render_todos` 那样两种都吃（那个
+    函数已经随动态渲染一起删掉了）。
+
+    钉住它还有个当下的理由：`_last_write_wins` 现在**不再是**并行调用的挡箭牌
+    （那件事改由 `after_model` 拦截承担了），所以很容易被当成冗余删掉。但它
+    仍然要留着 —— 拦截只覆盖 `TodoMiddleware` 装上的情况，而 reducer 保证的是
+    「就算有别的路径在同一超步写 todos，图也不会崩」。
     """
     _reset()
     _SCRIPT.append(_text_round("什么都不用做。"))
@@ -608,6 +788,8 @@ def test_todos_reducer_starts_empty_not_absent() -> None:
 
     state = engine._graph.get_state({"configurable": {"thread_id": "jca-cli"}})
     assert state.values["todos"] == [], state.values["todos"]
+    # prompt 里没有清单，但静态说明必须在 —— 模型得先知道有这个工具
+    assert _system_prompts()[0].endswith(_static_prompt_tail()), _system_prompts()[0]
     assert "Current todo list" not in _system_prompts()[0], _system_prompts()[0]
 
 
@@ -624,12 +806,13 @@ def main() -> int:
         test_state_schema_merges_middleware_fields,
         test_state_schema_rejects_duplicate_fields,
         test_graph_nodes_see_middleware_state_fields,
-        test_render_todos_marks_each_state,
-        test_write_todos_updates_state_and_shows_up_next_call,
+        test_todo_middleware_prompt_stability,
+        test_write_todos_updates_state_through_history_not_prompt,
         test_todo_tool_returns_command_with_matching_message,
         test_safety_retry_goes_back_through_before_model,
         test_after_model_does_not_run_on_the_retry_path,
-        test_parallel_write_todos_does_not_break_the_graph,
+        test_parallel_write_todos_is_rejected_and_the_model_rewrites,
+        test_rejected_round_gives_every_call_a_receipt,
         test_todos_reducer_starts_empty_not_absent,
     ]
     failed = 0

@@ -1,4 +1,4 @@
-"""`write_todos` 的两段提示词，外加把 state 里的清单渲染成文字。
+"""`write_todos` 的两段提示词。
 
 这里放的是**英文**提示词，而这个项目的注释、日志、工具返回值全是中文 ——
 两者不一致是有意的。这两段是从 langchain 官方的 todo 中间件逐字搬过来的，
@@ -9,6 +9,14 @@
 
 想改措辞的话，改完请重新实测模型的行为 —— 提示词的效用只能靠观察，
 不能靠读。
+
+## 这里曾经还有一个 `render_todos`
+
+早先 `TodoMiddleware.wrap_model` 会把 `state["todos"]` 渲染成清单拼到 system
+prompt 末尾，`render_todos` 就是那个渲染器。它已经删掉了：prompt 尾部每轮都变
+会打断服务端的前缀 KV Cache，而且清单在历史消息里本来就有（模型自己写的那次
+工具调用 + 回执），再渲染一份是三重冗余。现在清单只走历史，`state["todos"]`
+留给 UI 与持久化快照用。详见 `engine/middleware/todo.py` 的模块说明。
 """
 
 # 工具描述。挂到 `@tool(description=...)` 上，模型看到的「这个工具是干什么的」。
@@ -102,35 +110,7 @@ Writing todos takes time and tokens, use it when it is helpful for managing comp
 When you finish all work, write your final answer in the message AFTER your last `write_todos` call — not in the same turn as that call. Start the final message with the substantive content the user asked for — the data, computation, summary, or analysis. The user wants the result, not confirmation that the work is done."""  # noqa: E501
 
 
-# 清单在 system prompt 里的样子。三个符号对应三种状态，模型一眼能分出
-# 「还没做」「在做」「做完了」。
-_MARKS = {"pending": "[ ]", "in_progress": "[~]", "completed": "[x]"}
-
-
-def render_todos(todos: list | None) -> str:
-    """把 state 里的清单渲染成 system prompt 的一段。
-
-    没有清单时返回空串 —— 调用方按「空串就不加」处理即可，不用先判空再调。
-
-    这里现读现渲染、不做缓存：清单是**每次模型调用**都要最新的一份，
-    缓存它只会多一个「什么时候该失效」的问题。
-
-    认不出的状态（模型可能写个别的词）原样显示状态名而不是丢掉这一条：
-    丢一条会让模型以为自己写的清单没生效，于是反复重写。
-    """
-    if not todos:
-        return ""
-    lines = []
-    for item in todos:
-        content = str(item.get("content", "")).strip()
-        status = str(item.get("status", "pending"))
-        mark = _MARKS.get(status, f"[{status}]")
-        lines.append(f"- {mark} {content}")
-    return "\n".join(["## Current todo list", "", *lines])
-
-
 __all__ = [
     "WRITE_TODOS_SYSTEM_PROMPT",
     "WRITE_TODOS_TOOL_DESCRIPTION",
-    "render_todos",
 ]

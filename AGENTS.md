@@ -30,7 +30,7 @@ uv run python -m tests.test_tools            # 文件与 shell 工具，打真�
 
 - `engine/agent.py:199-201` 三个 `add_node` 上的 `input_schema=state_schema`，**一个都不能删**。不写的话 LangGraph 会拿节点函数第一个参数的类型标注当输入 schema，于是中间件加的字段在进节点前被悄悄滤掉：图照跑、工具照写、checkpointer 里也存得住，**只有节点里读不到，一句报错都没有**。
 - `agent` 节点**没有静态出边**，下一步完全由它返回的 `Command(goto=...)` 决定。**不要加** `add_edge("agent", "after_model")`：`Command.goto` 是**追加分支**而不是改道，被内容判定拦下的重试轮会在**同一个超步**里跑完两个钩子节点，只要任何中间件在两个钩子里写同一个 state 键，就直接 `InvalidUpdateError`。
-- **`after_model` 不能往 `messages` 追加任何消息。** 下一跳 `tools_condition` 读的是**最后一条**消息——塞一条 `HumanMessage` 等于告诉它「模型没要求调工具」，图直接结束，模型刚请求的工具永不执行。静默。
+- **`after_model` 改 state，但改不了去向。** 下一跳是 `tools_condition`，它读**最后一条**消息——往 `messages` 里塞一条 `HumanMessage` 等于告诉它「模型没要求调工具」，图直接结束，模型刚请求的工具永不执行。静默。塞 `ToolMessage` 是合法的（`TodoMiddleware` 就这么给模型递错误回执），但它**拦不住这一轮**：`tools_condition` 仍会看见最后那条 `AIMessage` 里的工具申请，照样送进 `ToolNode`。要真正改道必须返回 `Command(goto=...)`。
 - **`before_model` 不能塞 `AIMessage`。** `_translate_update` 会把**任何**节点产出的 `AIMessage` 当成「模型申请调工具」上报给界面。
 - **钩子顺序有语义**：`before_model` 按声明序、`after_model` **逆序**（包起来的东西按逆序拆）。越靠后声明的中间件越靠近提示词末尾，也就优先级最高。**写反了照样跑**，只是某个中间件在 after 里会读到旧值。
 - 中间件的 `state_schema` 与 `tools` 是**类属性**，不是构造参数——建图时就要读到，那时还没有实例。

@@ -7,11 +7,19 @@
 `after_model` 两个节点本来就存在，它们会遍历管道里的每一个中间件。
 """
 
-from .base import BaseMiddleware, MiddlewarePipeline, ModelHandler, ModelRequest, StateUpdate
+from .base import (
+    BaseMiddleware,
+    HookResult,
+    MiddlewarePipeline,
+    ModelHandler,
+    ModelRequest,
+    StateUpdate,
+)
 from .todo import TodoItem, TodoMiddleware, TodoState, write_todos
 
 __all__ = [
     "BaseMiddleware",
+    "HookResult",
     "MiddlewarePipeline",
     "ModelHandler",
     "ModelRequest",

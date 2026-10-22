@@ -16,7 +16,9 @@
 三个钩子各管一件事，分工是按**改什么**分的：
 
 - `before_model` / `after_model` 改的是 **state**：它们跑在图节点里，返回值就是
-  状态更新。适合「在调用前把某些东西准备好」「调用后收尾」。
+  状态更新。适合「在调用前把某些东西准备好」「调用后收尾」。（要改**下一步去
+  哪儿** —— 比如拦下一轮不让工具执行 —— 就返回 `Command(goto=...)`，见
+  `_collect`。）
 - `wrap_model` 改的是**这一次调用**：system prompt、工具集、要发的消息。
   它拿到的 `ModelRequest` 是一次性的，调用完就丢 —— 下一轮 ReAct 会重新建一份。
   这是 req.md 反复强调的那点：**system prompt 每次调用现造，不存进历史**。存进
@@ -47,9 +49,14 @@ from typing import Any, Callable, Sequence, TypedDict, get_type_hints
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AnyMessage, SystemMessage
 from langchain_core.tools import BaseTool
+from langgraph.types import Command
 
 # 状态增量。图节点返回的就是它：`{字段名: 新值}`。
 StateUpdate = dict[str, Any]
+
+# 钩子的返回值。绝大多数时候是状态增量或 None；少数情况是一个 `Command` ——
+# 那个钩子要改的是**下一步去哪儿**，不只是 state（见 `MiddlewarePipeline._collect`）。
+HookResult = StateUpdate | Command | None
 
 # 一次模型调用的「末端」：把 request 真正发出去，拿回一条 AIMessage。
 # 最内层的 `_invoke` 就是它；中间的中间件拿到的 handler 是「下一层」。
@@ -95,7 +102,7 @@ class BaseMiddleware:
     # 这个中间件提供的工具。
     tools: Sequence[BaseTool] = ()
 
-    def before_model(self, state: Any) -> StateUpdate | None:
+    def before_model(self, state: Any) -> HookResult:
         """进入 agent 节点之前跑。返回值是状态增量，None 表示不改。
 
         在图节点里跑，所以拿到的 `state` 是**整个会话状态**（含历史消息）。
@@ -105,19 +112,29 @@ class BaseMiddleware:
         AIMessage**：`stream_turn` 的 updates 翻译会把任何 AIMessage 上的
         `tool_calls` 当成「模型申请调工具」报给用户（见 `_translate_update`），
         而那其实是我们自己写的。
+
+        想改**下一步去哪儿**（而不只是 state）就返回一个 `Command(goto=...)`：
+        `_collect` 会把它原样透传给图。同一个钩子里只能有一个中间件这么做，
+        而且它一旦返回 Command，同层的状态增量就不会再合并了（见 `_collect`）。
         """
         return None
 
-    def after_model(self, state: Any) -> StateUpdate | None:
+    def after_model(self, state: Any) -> HookResult:
         """模型答复之后、决定要不要调工具之前跑。返回值是状态增量，None 表示不改。
 
         这时 state 里最后一条已经是模型刚吐出来的 AIMessage，所以拿得到
         `tool_calls`。注意它**在工具执行之前** —— 工具的结果这里还看不到。
 
-        **这里不要动 `messages`。** 下一步的去向由 `tools_condition` 决定，它读的是
-        `messages` 的最后一条：追加一条 HumanMessage 会让它认为「模型没有申请工具」，
-        于是图直接结束 —— 模型刚申请的那个工具**再也不会被执行**，而且没有任何报错。
-        （实测确认过。）要加提示就加在 `before_model` 或 `wrap_model` 里。
+        **这里不要往 `messages` 里追加消息。** 下一步的去向由 `tools_condition`
+        决定，它读的是 `messages` 的最后一条：追加一条 HumanMessage 会让它认为
+        「模型没有申请工具」，于是图直接结束 —— 模型刚申请的那个工具**再也不会
+        被执行**，而且没有任何报错。（实测确认过。）要加提示就加在
+        `before_model` 或 `wrap_model` 里。
+
+        想**拦下**这一轮（比如拒绝模型这次的工具申请）就不能只返回状态增量：
+        追加一条 ToolMessage 并不会阻止 `tools_condition` 把这一轮送进 ToolNode，
+        那条消息会因为没有配对的 tool_call 被 UI 丢掉，而工具照跑不误。要真正
+        改道得返回 `Command(goto=...)`，见 `TodoMiddleware.after_model` 的实测记录。
         """
         return None
 
@@ -213,27 +230,43 @@ class MiddlewarePipeline:
         return TypedDict("AgentState", fields)
 
     # —— 三个钩子 ————————————————————————————————————————————
-    def before_model(self, state: Any) -> StateUpdate | None:
+    def before_model(self, state: Any) -> HookResult:
         """正序跑所有中间件的 before_model，把返回值合并成一个状态增量。"""
         return self._collect("before_model", state, self._middlewares)
 
-    def after_model(self, state: Any) -> StateUpdate | None:
+    def after_model(self, state: Any) -> HookResult:
         """逆序跑所有中间件的 after_model（洋葱按逆序拆开）。"""
         return self._collect("after_model", state, reversed(self._middlewares))
 
     @staticmethod
-    def _collect(hook: str, state: Any, middlewares) -> StateUpdate | None:
+    def _collect(hook: str, state: Any, middlewares) -> HookResult:
         """调一遍钩子并按顺序合并返回值。
 
         合并是**后者覆盖前者**（dict 的 update），和 LangGraph 自己的 state
         更新语义一致。全都没返回东西时给 None：LangGraph 对「节点返回 None」
         的处理是「什么都不更新」，比返回一个空 dict 更明确。
+
+        ## Command 是原样透传的，不参与合并
+
+        钩子想改的是**下一步去哪儿**时就返回 `Command(goto=...)`。这件事没法
+        「合并」：一个节点只能有一个去向，两个中间件各给一个 goto 就是真冲突。
+        所以约定是**先返回 Command 的那个赢**，它之后（以及之前已经合进来）的
+        状态增量**一并丢弃** —— 不是被覆盖，是整份不再使用。
+
+        为什么值得为它加这段：不这么写的话 `update.update(extra)` 会撞上
+        `Command` 不可迭代，抛 `TypeError: 'Command' object is not iterable`。
+        那个异常会被 `stream_turn` 的兜底 except 翻成一条语焉不详的
+        `AgentError(kind="api")`，看起来像「调用模型失败」，与真实原因无关。
+        （实测确认过。）所以要拦下一轮、而不是只改 state 的中间件，必须走这条路。
         """
         update: StateUpdate = {}
         for mw in middlewares:
             extra = getattr(mw, hook)(state)
-            if extra:
-                update.update(extra)
+            if extra is None:
+                continue
+            if isinstance(extra, Command):
+                return extra
+            update.update(extra)
         return update or None
 
     # —— 真正的调用 ————————————————————————————————————————————
@@ -274,6 +307,7 @@ class MiddlewarePipeline:
 
 __all__ = [
     "BaseMiddleware",
+    "HookResult",
     "MiddlewarePipeline",
     "ModelHandler",
     "ModelRequest",

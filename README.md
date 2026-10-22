@@ -218,10 +218,13 @@ context is cheap next to a model request.
 
 Two rules come with the two hook nodes, and both are silent when broken:
 
-- **`after_model` must not append messages.** The next hop is `tools_condition`, which
+- **`after_model` changes state but not the route.** The next hop is `tools_condition`, which
   reads the *last* message: adding a `HumanMessage` there tells it the model did not ask
   for a tool, so the graph ends and the tool the model just requested is never executed.
-  Nothing raises.
+  Nothing raises. (Appending a `ToolMessage` is legal — `TodoMiddleware` does it to hand the
+  model an error receipt — but it does **not** stop the round: `tools_condition` still sees
+  the tool calls in the last `AIMessage` and sends it to `ToolNode`. To actually divert the
+  round you must return a `Command`; see the parallel-`write_todos` section below.)
 - **The safety retry never reaches `after_model`.** `agent` has no static out-edge; it
   returns `Command(goto=...)` — `after_model` on success, `before_model` on a retry, since
   a blocked round has no model reply for a post-model hook to see. This is also why the
@@ -238,8 +241,9 @@ be a middleware deciding *for* the model), but every middleware here only adds t
 request. The request is built fresh on each call and dropped afterwards, which is why the
 system prompt is **never stored in the state**: a prompt kept in history gets re-sent on
 every subsequent turn, burns tokens, and makes "who changed it, and when" unanswerable.
-The one thing that *is* state — the todo list — is re-read from the state and re-rendered
-on each call, so the model always sees the current version instead of a stale copy.
+
+**A hook may also return a `Command`**, when what it needs to change is not the state but
+*where the graph goes next*. See the parallel-`write_todos` case below.
 
 Tools follow the same split. `tools/` is the **resident** registry (`build_tools()`):
 `list_dir`, `read_file`, `run_cmd` and friends exist in every session. A tool that a
@@ -249,8 +253,7 @@ that `TodoMiddleware` declares. The tool set is computed per call
 (`MiddlewarePipeline.tools`), so "always mount" and "mount only in these rounds" are one
 line apart.
 
-`TodoMiddleware` is the first one. It adds `todos` to the state, mounts `write_todos`, and
-appends the current checklist to the system prompt on every call:
+`TodoMiddleware` is the first one. It adds `todos` to the state and mounts `write_todos`:
 
 ```
 ● write_todos(todos=[{content: "read engine/agent.py", status: "in_progress"}, ...])
@@ -262,10 +265,34 @@ synchronises the state" a single step: the same return value writes `todos` **an
 the model its `ToolMessage` receipt. There is no `after_model` pass that scans what the
 model just called and copies the result into the state — that copy would eventually drift
 from the truth. (The matching `ToolMessage` is not optional: `ToolNode` rejects a command
-without one.) The `todos` field carries a last-write-wins reducer, because a model calling
-`write_todos` twice in one round — which it does, despite the tool description asking it not
-to — would otherwise kill the graph with `InvalidUpdateError: Can receive only one value
-per step`, surfacing to you as a generic "调用模型失败" error.
+without one.) The `todos` field carries a last-write-wins reducer, so a stray second write
+in one superstep cannot kill the graph with `InvalidUpdateError: Can receive only one value
+per step`.
+
+**Its system prompt is 100% static, and that is deliberate.** An earlier version re-read
+`state["todos"]` on every call and appended a rendered checklist to the prompt. That cost
+two things: the prompt's tail changed on every request, so a server's **prefix KV cache**
+could never match past it — every historical message after it was re-encoded, raising TTFT
+and token cost; and the checklist was the third copy of information the model already had,
+since its own `write_todos` call and the receipt we just handed back are both in the
+history. So the plan now travels through **the history** (in-context memory) and the prompt
+stays byte-for-byte identical for the whole session. `state["todos"]` is still maintained —
+its consumers are the UI and persistence snapshots, not the prompt.
+
+**Parallel `write_todos` calls are rejected, not resolved.** The model does call it twice in
+one round despite the tool description asking it not to, and the two calls carry two
+conflicting full checklists. Rather than letting the last one win, `TodoMiddleware.after_model`
+rejects the whole round: it gives each call an error `ToolMessage` and sends the graph back
+to `before_model` so the model sees the error and rewrites.
+
+This is the one place where a hook returns a `Command` instead of a state delta, and it has
+to: `after_model` returning only `{"messages": [...]}` changes the state but **not where the
+graph goes next**. `tools_condition` still reads the last message, sees the tool calls, and
+sends the round to `ToolNode` anyway — both real tools run, the two `Command` updates
+overwrite each other into an empty `todos`, and the error message matches no `tool_call_id`
+so the UI drops it. The model is never even re-invoked. `MiddlewarePipeline._collect`
+therefore passes a `Command` straight through, unmerged, and the first middleware to return
+one wins (a node has exactly one next hop, so there is nothing to merge).
 
 The state schema follows the same principle. A middleware declares its own fields in
 `state_schema`, and `MiddlewarePipeline.build_state_schema` merges them into the graph's
@@ -441,13 +468,22 @@ conversation continue — the model just never sees its own plan again, and noth
 So it takes evidence from the model's side: the fake model records every message list it
 is handed and every tool set it is bound to, and the assertions are about those records.
 One case drives the whole graph — the model calls `write_todos`, the tool writes the state,
-and the **next** call's system prompt contains the checklist — which is four separately
-working mechanisms in a row, none of which fails loudly on its own. Three regression cases
-came out of reviewing the design and pin failures that are all silent: a hook node that
-annotates its `state` parameter with the base state and therefore never sees `todos`; a
-retry that runs `after_model` on a round with no model reply; two `write_todos` calls in
-one round. Two more count `before_model` invocations across a safety retry and check the
-merged state schema keeps its reducers.
+and the **next** call sees the plan in its history — which is four separately working
+mechanisms in a row, none of which fails loudly on its own.
+
+Two cases exist purely for the prompt-stability property, because nothing about a changing
+prompt is visible from the outside: one drives the pipeline directly and swaps the `todos`
+contents underneath it, the other runs two real turns through the graph and collects every
+`SystemMessage` the fake model was ever handed — four calls, one byte-identical prompt,
+with the plan confirmed to be in the state and in the message history instead.
+
+Three regression cases came out of reviewing the design and pin failures that are all
+silent: a hook node that annotates its `state` parameter with the base state and therefore
+never sees `todos`; a retry that runs `after_model` on a round with no model reply; two
+`write_todos` calls in one round — where the assertion that matters is that the model got a
+second chance to rewrite, since the obvious implementation (append an error `ToolMessage`)
+lets both real tools run anyway and leaves `todos` empty. Two more count `before_model`
+invocations across a safety retry and check the merged state schema keeps its reducers.
 
 The tools suite is the one that touches a disk, so it works in a temporary directory it
 creates **inside** the working directory and deletes afterwards — `safe_path` only allows
